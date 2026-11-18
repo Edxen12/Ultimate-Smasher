@@ -3,25 +3,46 @@
 All offsets come from the original Ultimate Smasher (Ret-HZ, 2019); the fighter
 table offsets were corrected locally (8-byte slots from 0x53FF40, official order).
 """
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
 import os
+import re
 import shutil
+import stat
 import struct
 import tempfile
 import time
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
 SAVE_SIZE = 5982968
-RYUJINX_SAVE = os.path.expanduser(
-    "~/.var/app/io.github.ryubing.Ryujinx/config/Ryujinx/bis/user/save/"
-    "0000000000000001/0/save_data/system_data.bin")
+_RYUJINX_PRIMARY_SAVE = "Ryujinx/bis/user/save/0000000000000001/0/save_data/system_data.bin"
+RYUJINX_SAVE = os.path.join(
+    os.path.expanduser("~/.var/app/io.github.ryubing.Ryujinx/config"), _RYUJINX_PRIMARY_SAVE)
 BACKUP_DIR = os.path.expanduser("~/Games/Switch/smash-save-backups")
 BACKUP_KEEP = 20
+_BACKUP_NAME = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?")
+_BACKUP_FILES = {"system_data.bin", "slot0_system_data.bin", "slot1_system_data.bin"}
+_UNCHECKED = object()
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 FMT = {1: "<B", 2: "<H", 4: "<I"}
 
 
 class InvalidSave(Exception):
     pass
+
+
+class SaveConflict(OSError):
+    """The files on disk no longer match the versions opened by this editor."""
+
+
+class CopyPublishedError(OSError):
+    """An exported copy exists, but cleanup or directory synchronization failed."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +123,8 @@ FIGHTERS = [
 
 
 def fighter_offset(i):
+    if not isinstance(i, int) or not 0 <= i < len(FIGHTERS):
+        raise ValueError("Fighter index is outside the supported roster")
     return FIGHTER_FIRST + 8 * i
 
 
@@ -143,14 +166,38 @@ STATS = {
 
 
 def default_save_path():
-    return RYUJINX_SAVE if os.path.exists(RYUJINX_SAVE) else ""
+    native_config = os.environ.get("XDG_CONFIG_HOME", "")
+    if not os.path.isabs(native_config):
+        native_config = os.path.expanduser("~/.config")
+    legacy_config = os.path.expanduser("~/.var/app/org.ryujinx.Ryujinx/config")
+    candidates = (
+        RYUJINX_SAVE,
+        os.path.join(legacy_config, _RYUJINX_PRIMARY_SAVE),
+        os.path.join(native_config, _RYUJINX_PRIMARY_SAVE),
+    )
+    for path in candidates:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and info.st_size == SAVE_SIZE:
+            return path
+    return ""
+
+
+def _slot(path):
+    parts = os.path.abspath(path).split(os.sep)
+    if len(parts) > 3 and parts[-2] == "save_data" and parts[-3] in ("0", "1"):
+        return parts[-3]
+    return None
 
 
 def mirror_path(path):
     """Ryujinx keeps two commit slots (.../0/save_data and .../1/save_data)."""
-    parts = os.path.abspath(path).split(os.sep)
-    if len(parts) > 3 and parts[-2] == "save_data" and parts[-3] in ("0", "1"):
-        parts[-3] = "1" if parts[-3] == "0" else "0"
+    slot = _slot(path)
+    if slot is not None:
+        parts = os.path.abspath(path).split(os.sep)
+        parts[-3] = "1" if slot == "0" else "0"
         other = os.sep.join(parts)
         if os.path.isdir(os.path.dirname(other)):
             return other
@@ -172,44 +219,141 @@ def ryujinx_running():
     return False
 
 
-def _atomic_write(path, data):
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".smasher-")
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_disk(path):
+    """Read a bounded snapshot; None represents a missing commit slot."""
+    def regular_file(name, flags):
+        return os.open(name, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+
+    try:
+        with open(path, "rb", opener=regular_file) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError(f"Expected a regular save file: {path}")
+            return stream.read(SAVE_SIZE + 1)
+    except FileNotFoundError:
+        return None
+
+
+@contextmanager
+def _lock_save_directory(path):
+    directory = os.path.dirname(path)
+    if _slot(path) is not None:
+        directory = os.path.dirname(os.path.dirname(directory))
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _publish_new(temporary, path):
+    """Publish without replacing an existing entry. Return whether the temp still exists."""
+    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if rename is not None:
+        # Linux supports this flag on filesystems that cannot create hard links.
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        if rename(_AT_FDCWD, os.fsencode(temporary), _AT_FDCWD, os.fsencode(path), _RENAME_NOREPLACE) == 0:
+            return False
+        error = ctypes.get_errno()
+        if error not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            raise OSError(error, os.strerror(error), path)
+    try:
+        os.link(temporary, path)
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.EOPNOTSUPP):
+            raise OSError(error.errno, "The destination does not support safe creation of a new save copy", path) from error
+        raise
+    return True
+
+
+def _atomic_write(path, data, *, expected=_UNCHECKED, new_file=False):
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".smasher-")
     try:
         try:
-            os.fchmod(fd, os.stat(path).st_mode & 0o7777)  # keep the original permissions
-        except FileNotFoundError:
-            os.fchmod(fd, 0o644)
-        with os.fdopen(fd, "wb") as f:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream as f:
+            if not new_file:
+                try:
+                    mode = os.stat(path).st_mode & 0o7777
+                except FileNotFoundError:
+                    mode = 0o644
+                os.fchmod(f.fileno(), mode)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if expected is not _UNCHECKED and _read_disk(path) != expected:
+            raise SaveConflict(f"The save changed on disk while preparing to replace {path}.")
+        if new_file:
+            linked = _publish_new(tmp, path)
+            try:
+                if linked:
+                    os.unlink(tmp)
+                _sync_directory(directory)
+            except OSError as error:
+                raise CopyPublishedError(
+                    error.errno,
+                    f"The copy was created, but cleanup or directory synchronization failed: {error}. "
+                    "Its durability is uncertain",
+                    path,
+                ) from error
+        else:
+            os.replace(tmp, path)
+            _sync_directory(directory)
     except BaseException:
-        if os.path.exists(tmp):
+        with suppress(OSError):
             os.unlink(tmp)
         raise
 
 
 class SaveFile:
     def __init__(self, path):
+        path = os.path.realpath(path)
         try:
-            size = os.path.getsize(path)
+            raw = _read_disk(path)
+            other = mirror_path(path)
+            mirror = _read_disk(other) if other else None
         except OSError as e:
-            raise InvalidSave(f"Can't read the file: {e.strerror}") from e
-        if size != SAVE_SIZE:
+            raise InvalidSave(f"Can't read the file: {e.strerror or e}") from e
+        if raw is None:
+            raise InvalidSave("Can't read the file: file not found")
+        if len(raw) != SAVE_SIZE:
             raise InvalidSave(f"Not a Smash Ultimate system_data.bin "
-                              f"(size {size:,} bytes, expected {SAVE_SIZE:,}).")
-        with open(path, "rb") as f:
-            raw = f.read()
+                              f"(size {len(raw):,} bytes, expected {SAVE_SIZE:,}).")
+        if mirror is not None and len(mirror) != SAVE_SIZE:
+            raise InvalidSave("The other Ryujinx slot has an unsupported size; check both save files first.")
         self.path = path
         self.data = bytearray(raw)
         self.clean = raw
+        self._mirror = other
+        self._disk_snapshots = {path: raw}
+        if other:
+            self._disk_snapshots[other] = mirror
+        self.backup_warning = None
 
     # --- raw access -----------------------------------------------------
     def get(self, offset, size=1):
+        self._validate_span(offset, size)
         return struct.unpack_from(FMT[size], self.data, offset)[0]
 
+    def _validate_span(self, offset, size):
+        if size not in FMT or not isinstance(offset, int) or not 0 <= offset <= len(self.data) - size:
+            raise ValueError("Field offset or size is outside the save data")
+
     def set(self, offset, value, size=1):
+        self._validate_span(offset, size)
         limit = (1 << (8 * size)) - 1
         if not 0 <= int(value) <= limit:
             raise ValueError(f"value {value} out of range 0..{limit}")
@@ -275,8 +419,11 @@ class SaveFile:
 
     def set_stats(self, values):
         """values: {offset: int}; validated as a whole before writing anything."""
-        for v in values.values():
-            if not 0 <= v <= STAT_MAX:
+        known = {off for rows in STATS.values() for _, off in rows}
+        for off, v in values.items():
+            if off not in known:
+                raise ValueError("Unknown statistic offset")
+            if not isinstance(v, int) or not 0 <= v <= STAT_MAX:
                 raise ValueError(f"{v} is out of range (0..{STAT_MAX:,})")
         for off, v in values.items():
             self.set(off, v, 4)
@@ -288,54 +435,230 @@ class SaveFile:
         self.data = bytearray(raw)
 
     # --- saving ---------------------------------------------------------
-    def save(self, backup_dir=None):
-        """Back up current files, write atomically, mirror the other Ryujinx slot."""
-        targets = [self.path] + ([mirror_path(self.path)] if mirror_path(self.path) else [])
-        backup = make_backup(targets, backup_dir)
+    def export_copy(self, path):
+        """Publish the edited bytes at a new path without changing the open save."""
         payload = bytes(self.data)
-        for t in targets:
-            _atomic_write(t, payload)
+        if len(payload) != SAVE_SIZE:
+            raise InvalidSave("The edited data has an unsupported size")
+        path = os.path.abspath(os.fsdecode(path))
+        other = self._mirror or mirror_path(self.path)
+        if os.path.realpath(path) in (self.path, other):
+            raise FileExistsError(errno.EEXIST, "Choose a path outside the active save slots", path)
+        _atomic_write(path, payload, new_file=True)
+        return path
+
+    def save(self, backup_dir=None):
+        """Check disk snapshots, back up, then replace slots with rollback on failure.
+
+        A group of filesystem replacements cannot be crash-atomic. The published
+        backup remains available even when a write or rollback fails.
+        """
+        if len(self.data) != SAVE_SIZE:
+            raise InvalidSave("The edited data has an unsupported size")
+        with _lock_save_directory(self.path):
+            return self._save_locked(backup_dir)
+
+    def _save_locked(self, backup_dir):
+        other = self._mirror or mirror_path(self.path)
+        targets = [self.path] + ([other] if other else [])
+        previous = {p: _read_disk(p) for p in targets}
+        for path, raw in previous.items():
+            if raw != self._disk_snapshots.get(path):
+                raise SaveConflict("The save changed on disk. Reopen the file before saving; your edits remain in the editor.")
+        backup = make_backup(targets, backup_dir, prune=False, _snapshots=previous)
+        # Copying the backup takes time: detect writers before replacing anything.
+        if any(_read_disk(path) != raw for path, raw in previous.items()):
+            raise SaveConflict(f"The save changed while preparing the backup. Reopen the file. Backup: {backup}")
+        payload = bytes(self.data)
+        attempted = []
+        try:
+            for path in targets:
+                attempted.append(path)
+                try:
+                    _atomic_write(path, payload, expected=previous[path])
+                except SaveConflict:
+                    attempted.pop()
+                    raise
+            if any(_read_disk(path) != payload for path in targets):
+                raise SaveConflict("At least one save slot changed during the write.")
+        except OSError as error:
+            failed = []
+            for path in reversed(attempted):
+                try:
+                    current = _read_disk(path)
+                    if current == previous[path]:
+                        continue
+                    if current != payload:
+                        raise OSError("file changed during recovery")
+                    if previous[path] is None:
+                        os.unlink(path)
+                        _sync_directory(os.path.dirname(path))
+                    else:
+                        _atomic_write(path, previous[path], expected=payload)
+                except OSError as recovery_error:
+                    failed.append(f"{path}: {recovery_error}")
+            conflict = isinstance(error, SaveConflict)
+            recovery = "Editor writes rolled back." if conflict else "Original files restored."
+            if failed:
+                recovery = "Recovery incomplete: " + "; ".join(failed)
+            error_type = SaveConflict if conflict else OSError
+            raise error_type(f"Save failed: {str(error).rstrip('.')}. {recovery} "
+                             f"Your edits are still pending. Backup: {backup}") from error
         self.clean = payload
+        self._disk_snapshots = {p: payload for p in targets}
+        self._mirror = other
+        self.backup_warning = None
+        try:
+            prune_backups(backup_dir)
+        except OSError as error:
+            # Retention is housekeeping: a completed save must not be reported as failed.
+            self.backup_warning = f"Saved, but old backups could not be pruned: {error}"
         return backup
 
 
-def make_backup(paths, backup_dir=None):
+def make_backup(paths, backup_dir=None, *, prune=True, _snapshots=None):
     backup_dir = backup_dir or BACKUP_DIR
-    existing = [p for p in paths if os.path.exists(p)]
+    if _snapshots is None:
+        sources = dict.fromkeys(os.path.realpath(p) for p in paths)
+        _snapshots = {p: _read_disk(p) for p in sources}
+    existing = [(path, raw) for path, raw in _snapshots.items() if raw is not None]
     if not existing:
         return None
+    if any(len(raw) != SAVE_SIZE for _, raw in existing):
+        raise InvalidSave("Cannot back up files with an unsupported save size.")
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    dest = os.path.join(backup_dir, stamp)
-    n = 1
-    while os.path.exists(dest):
-        n += 1
-        dest = os.path.join(backup_dir, f"{stamp}_{n}")
-    os.makedirs(dest)
-    for p in existing:
-        slot = p.split(os.sep)[-3] if mirror_path(p) else "file"
-        shutil.copy2(p, os.path.join(dest, f"slot{slot}_system_data.bin" if slot != "file" else "system_data.bin"))
-    prune_backups(backup_dir)
+    os.makedirs(backup_dir, exist_ok=True)
+    stage = tempfile.mkdtemp(dir=backup_dir, prefix=".smasher-backup-")
+    try:
+        entries = []
+        for p, raw in existing:
+            slot = _slot(p)
+            filename = f"slot{slot}_system_data.bin" if slot is not None else "system_data.bin"
+            target = os.path.join(stage, filename)
+            if os.path.exists(target):
+                raise OSError(f"Multiple sources would use the backup filename {filename}.")
+            shutil.copy2(p, target)
+            with open(target, "rb") as stream:
+                if stream.read(SAVE_SIZE + 1) != raw:
+                    raise SaveConflict(f"The source changed while copying the backup: {p}")
+                os.fsync(stream.fileno())
+            entries.append({"source": p, "file": filename, "size": len(raw),
+                            "sha256": hashlib.sha256(raw).hexdigest()})
+        with open(os.path.join(stage, "metadata.json"), "w", encoding="utf-8") as stream:
+            json.dump({"created_at": time.time(), "files": entries}, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _sync_directory(stage)
+        if any(_read_disk(path) != raw for path, raw in _snapshots.items()):
+            raise SaveConflict("The save changed while preparing the backup. Try again with the game closed.")
+        n = 1
+        while True:
+            dest = os.path.join(backup_dir, stamp if n == 1 else f"{stamp}_{n}")
+            if not os.path.lexists(dest):
+                try:
+                    os.rename(stage, dest)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                        raise
+            n += 1
+        _sync_directory(backup_dir)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    if prune:
+        prune_backups(backup_dir)
     return dest
+
+
+def _backup_metadata(folder):
+    try:
+        with open(os.path.join(folder, "metadata.json"), encoding="utf-8") as stream:
+            data = json.load(stream)
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        raise InvalidSave("The backup metadata is damaged.")
+    return data
+
+
+def backup_details(folder):
+    """Optional metadata for display; legacy backups remain supported.
+
+    SHA-256 describes backup contents, not a checksum required by the game.
+    """
+    try:
+        data = _backup_metadata(folder)
+        if data is not None:
+            return data
+    except (OSError, ValueError, InvalidSave):
+        pass
+    return {"created_at": os.path.getmtime(folder), "files": []}
+
+
+def read_backup(path):
+    """Read a backup and verify its recorded digest when metadata exists."""
+    raw = _read_disk(path)
+    if raw is None or len(raw) != SAVE_SIZE:
+        raise InvalidSave("The backup file is missing or has an unsupported size.")
+    try:
+        metadata = _backup_metadata(os.path.dirname(path))
+    except ValueError as error:
+        raise InvalidSave("The backup metadata is damaged.") from error
+    if metadata is not None:
+        entry = next((record for record in metadata["files"] if isinstance(record, dict)
+                      and record.get("file") == os.path.basename(path)), None)
+        if (entry is None or entry.get("size") != len(raw)
+                or entry.get("sha256") != hashlib.sha256(raw).hexdigest()):
+            raise InvalidSave("This backup does not match its recorded size or SHA-256.")
+    return raw
 
 
 def list_backups(backup_dir=None):
     """Newest first: [(folder, file_to_restore, mtime)]."""
     backup_dir = backup_dir or BACKUP_DIR
     out = []
-    if not os.path.isdir(backup_dir):
+    try:
+        names = os.listdir(backup_dir)
+    except FileNotFoundError:
         return out
-    for name in os.listdir(backup_dir):
-        d = os.path.join(backup_dir, name)
-        if not os.path.isdir(d):
+    for name in names:
+        if name.startswith("."):
             continue
-        files = sorted(f for f in os.listdir(d) if f.endswith("system_data.bin"))
-        if files:
-            f = os.path.join(d, files[0])
-            out.append((d, f, os.path.getmtime(d)))  # backup time, not the save's mtime
-    out.sort(key=lambda t: os.path.basename(t[0]), reverse=True)
+        d = os.path.join(backup_dir, name)
+        if not os.path.isdir(d) or os.path.islink(d):
+            continue
+        try:
+            files = sorted(f for f in os.listdir(d) if f.endswith("system_data.bin")
+                           and os.path.isfile(os.path.join(d, f)) and not os.path.islink(os.path.join(d, f)))
+            if not files:
+                continue
+            entries = backup_details(d)["files"]
+            primary = entries[0].get("file") if entries and isinstance(entries[0], dict) else None
+            if not isinstance(primary, str) or primary not in _BACKUP_FILES:
+                primary = files[0]
+            out.append((d, os.path.join(d, primary), os.path.getmtime(d)))
+        except FileNotFoundError:
+            # A concurrent save may have pruned this folder.
+            continue
+    out.sort(key=lambda t: (t[2], os.path.basename(t[0])), reverse=True)
     return out
 
 
 def prune_backups(backup_dir=None, keep=BACKUP_KEEP):
-    for d, _, _ in list_backups(backup_dir)[keep:]:
-        shutil.rmtree(d, ignore_errors=True)
+    kept = 0
+    for d, _, _ in list_backups(backup_dir):
+        if not _BACKUP_NAME.fullmatch(os.path.basename(d)):
+            continue
+        try:
+            with os.scandir(d) as entries:
+                if any(entry.name not in _BACKUP_FILES | {"metadata.json"}
+                       or not entry.is_file(follow_symlinks=False) for entry in entries):
+                    continue
+            if kept >= keep:
+                shutil.rmtree(d)
+            else:
+                kept += 1
+        except FileNotFoundError:
+            if os.path.exists(d):
+                raise

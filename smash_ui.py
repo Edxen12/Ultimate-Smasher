@@ -3,23 +3,25 @@
 Everything is custom painted with QPainter and animated with QVariantAnimation.
 Editing goes through `Store`, which wraps a `save_data.SaveFile`.
 """
+import html
 import math
 import os
 import random
-import sys
 import time
+import unicodedata
 
 from PyQt5 import sip
 from PyQt5.QtCore import (
     QEasingCurve,
-    QObject,
     QPoint,
     QPointF,
     QPropertyAnimation,
     QRect,
     QRectF,
+    QSettings,
     QSize,
     Qt,
+    QThreadPool,
     QTimer,
     QUrl,
     QVariantAnimation,
@@ -35,6 +37,7 @@ from PyQt5.QtGui import (
     QIcon,
     QImage,
     QIntValidator,
+    QKeySequence,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -47,6 +50,8 @@ from PyQt5.QtWidgets import (
     QAbstractButton,
     QAbstractSpinBox,
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QGraphicsOpacityEffect,
     QLabel,
@@ -54,7 +59,9 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QScrollArea,
+    QShortcut,
     QSpinBox,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -63,42 +70,35 @@ import gamepad
 import hub_geometry as hg
 import save_data as sd
 import sfx
+from design_system import settings, stylesheet, tokens
+from editor_state import Store
+from save_jobs import DiskJob
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(BASE, "img")
 APP_TITLE = "ULTIMATE SMASHER"
 
 W, H = 1040, 590
-M = 24          # outer margin
+M = tokens.spacing.margin
 HB = 56         # header band height
 SB_H = 58       # status bar height
 TAB_Y, TAB_H = HB + 10, 64
 PANEL_Y = TAB_Y + TAB_H - 4
 PANEL_H = H - PANEL_Y - SB_H
-SLANT = 16
-TITLE_FONT = "Barlow Condensed"
-FA = "Font Awesome 6 Free"
-ROUND_FONT = "Nunito"
-STATUS = None
-CURSOR = None
+SLANT = tokens.borders.slant
+TITLE_FONT = tokens.type.display
+FA = tokens.type.icon
+ROUND_FONT = tokens.type.functional
 SFX = None
-PAD = None
-
-
-def set_stage(w, h):
-    """Logical size of the UI (the whole screen in fullscreen mode)."""
-    global W, H, PANEL_H
-    W, H = max(1040, int(w)), max(590, int(h))
-    PANEL_H = H - PANEL_Y - SB_H
 
 
 def play(name):
     if SFX:
         SFX.play(name)
 
-RED_TOP, RED_MID, RED_BOT = QColor("#ee2238"), QColor("#d4001c"), QColor("#a20014")
-YELLOW = QColor("#ffd400")
-WHITE = QColor("white")
+RED_TOP, RED_MID, RED_BOT = (QColor(c) for c in (tokens.colors.red_top, tokens.colors.red, tokens.colors.red_dark))
+YELLOW = QColor(tokens.colors.yellow)
+WHITE = QColor(tokens.colors.white)
 
 G = {  # Font Awesome 6 solid glyphs
     "open": "", "save": "", "help": "", "back": "",
@@ -109,6 +109,7 @@ G = {  # Font Awesome 6 solid glyphs
     "star": "", "gift": "", "flask": "", "users": "",
     "trophy": "", "folder": "", "bolt": "", "clock": "",
     "list": "", "hand": "",
+    "fullscreen": "\uf065",
 }
 
 
@@ -124,20 +125,50 @@ def lerp_color(c0, c1, t):
 
 def tween(owner, name, start, end, ms, on_value, easing=QEasingCurve.OutCubic,
           done=None, delay=0, loops=1):
-    """Animate a float and call on_value(v); replaces a running tween of the same name."""
+    """Animate a float, cancelling both the previous tween and its delayed start."""
     anims = owner.__dict__.setdefault("_tweens", {})
     old = anims.get(name)
     if old is not None:
-        old.stop()
+        if not sip.isdeleted(old):
+            old.stop()
+            if hasattr(old, "_start_timer"):
+                old._start_timer.stop()
+            old.deleteLater()
+        settings.untrack(old)
     a = QVariantAnimation(owner)
     a.setStartValue(float(start)); a.setEndValue(float(end))
     a.setDuration(int(ms)); a.setEasingCurve(QEasingCurve(easing)); a.setLoopCount(loops)
     a.valueChanged.connect(lambda v: on_value(float(v)))
-    if done:
-        a.finished.connect(done)
+    a._completed = False
+
+    def complete():
+        if a._completed:
+            return
+        a._completed = True
+        settings.untrack(a)
+        if done:
+            done()
+
+    def finish_without_motion():
+        if a._completed:
+            return
+        a.stop()
+        if hasattr(a, "_start_timer"):
+            a._start_timer.stop()
+        on_value(float(end))
+        complete()
+
+    a._finish_without_motion = finish_without_motion
+    a.finished.connect(complete)
     anims[name] = a
-    if delay:
-        QTimer.singleShot(int(delay), a.start)
+    settings.track(a)
+    if settings.reduced_motion:
+        finish_without_motion()
+    elif delay:
+        a._start_timer = QTimer(a)
+        a._start_timer.setSingleShot(True)
+        a._start_timer.timeout.connect(a.start)
+        a._start_timer.start(int(delay))
     else:
         a.start()
     return a
@@ -155,12 +186,13 @@ def para_path(r, s=SLANT):
 
 
 def label_font(px, weight=QFont.Bold, italic=False):
-    f = QFont(TITLE_FONT); f.setPixelSize(max(1, int(px))); f.setWeight(weight); f.setItalic(italic)
+    f = QFont(ROUND_FONT); f.setPixelSize(max(1, int(px))); f.setWeight(weight); f.setItalic(italic)
     return f
 
 
 def heavy_italic(px):
-    return label_font(px, QFont.Black, True)
+    f = QFont(TITLE_FONT); f.setPixelSize(max(1, int(px))); f.setWeight(QFont.Black); f.setItalic(True)
+    return f
 
 
 def fa_font(px):
@@ -176,8 +208,8 @@ def fit_font(make, text, width, start, minimum=10):
 
 
 def game_font(px, weight=QFont.Black):
-    font = QFont("DejaVu Sans")
-    font.setPixelSize(max(1, int(px))); font.setWeight(weight); font.setStretch(85)
+    font = QFont(ROUND_FONT)
+    font.setPixelSize(max(1, int(px))); font.setWeight(weight)
     return font
 
 
@@ -401,43 +433,12 @@ def fmt_duration(sec):
 
 
 # ============================================================== model ======
-class Store(QObject):
-    changed = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.save = None
-        self._dirty = False
-
-    @property
-    def loaded(self):
-        return self.save is not None
-
-    @property
-    def dirty(self):
-        # Comparing the whole save is costly; it is recomputed only when the
-        # store changes (every mutation goes through load / edit / write).
-        return self._dirty
-
-    def _emit(self):
-        self._dirty = self.save is not None and self.save.dirty
-        self.changed.emit()
-
-    def load(self, path):
-        self.save = sd.SaveFile(path)
-        self._emit()
-
-    def edit(self, fn):
-        fn(self.save)
-        self._emit()
-
-    def write(self):
-        dest = self.save.save()
-        self._emit()
-        return dest
-
-
 ARROWS = (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down)
+
+
+def search_key(text):
+    normalized = unicodedata.normalize("NFKD", text.casefold().replace("&", " and "))
+    return "".join(char for char in normalized if char.isalnum())
 
 
 def spatial_focus(container, widgets, key):
@@ -475,6 +476,10 @@ class AnimButton(QAbstractButton):
         super().__init__(parent)
         self.t = self.pt = self.ft = 0.0
         self.title, self.desc = title, desc
+        self.setAccessibleName(title or desc)
+        self.setAccessibleDescription(desc)
+        if desc:
+            self.setToolTip(desc)
         self.sfx = "select"
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -492,25 +497,29 @@ class AnimButton(QAbstractButton):
         return f
 
     def hover_to(self, on):
-        tween(self, "hover", self.t, 1.0 if on else 0.0, 170 if on else 260, self._set("t"))
+        tween(self, "hover", self.t, 1.0 if on else 0.0, 140 if on else 180, self._set("t"))
 
     def enterEvent(self, e):
         self.hover_to(True)
-        if STATUS and self.desc:
-            STATUS.describe(self.desc)
-        if self.focusPolicy() & Qt.TabFocus and self.isActiveWindow() and not self.hasFocus():
+        status = getattr(self.window(), "status", None)
+        if status and self.desc:
+            status.describe(self.desc)
+        editing = isinstance(QApplication.focusWidget(), (QLineEdit, QComboBox, QAbstractSpinBox))
+        if self.focusPolicy() & Qt.TabFocus and self.isActiveWindow() and not self.hasFocus() and not editing:
             self.setFocus(Qt.MouseFocusReason)   # mouse and pad share one cursor
 
     def leaveEvent(self, e):
         if not self.hasFocus():
             self.hover_to(False)
-        if STATUS:
-            STATUS.describe(None)
+        status = getattr(self.window(), "status", None)
+        if status:
+            status.describe(None)
 
     def focusInEvent(self, e):
         self.hover_to(True)
-        if STATUS and self.desc:
-            STATUS.describe(self.desc)
+        status = getattr(self.window(), "status", None)
+        if status and self.desc:
+            status.describe(self.desc)
         if e.reason() in (Qt.MouseFocusReason, Qt.TabFocusReason, Qt.BacktabFocusReason):
             play("move")
         super().focusInEvent(e)
@@ -525,14 +534,21 @@ class AnimButton(QAbstractButton):
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
-        tween(self, "press", self.pt, 0.0, 320, self._set("pt"), QEasingCurve.OutBack)
+        tween(self, "press", self.pt, 0.0, 180, self._set("pt"))
         super().mouseReleaseEvent(e)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.pulse(); self.click()
         elif e.key() in ARROWS:
-            e.ignore()   # spatial navigation is done by the page / overlay
+            parent = self.parentWidget()
+            while parent is not None and not isinstance(parent, (Page, Overlay)):
+                parent = parent.parentWidget()
+            if isinstance(parent, Page):
+                parent.app.move_focus(e.key())
+                e.accept()
+            else:
+                e.ignore()   # overlays handle their own focus chain
         else:
             super().keyPressEvent(e)
 
@@ -701,7 +717,12 @@ class PlateButton(AnimButton):
         path = para_path(r, self.slant)
         style = "yellow" if self.checked_look else self.style
         on = self.isEnabled()
-        if style == "yellow":
+        if not on:
+            style = "disabled"
+            g = QLinearGradient(r.topLeft(), r.bottomLeft())
+            g.setColorAt(0, QColor("#555861")); g.setColorAt(1, QColor("#30323a"))
+            fg = QColor("#aeb1ba")
+        elif style == "yellow":
             glow(p, path, QColor("#ffb800"), radius=10, strength=110 + 90 * self.t)
             g = QLinearGradient(r.topLeft(), r.bottomLeft())
             g.setColorAt(0, QColor("#ffe729")); g.setColorAt(0.5, YELLOW); g.setColorAt(1, QColor("#efb800"))
@@ -728,7 +749,7 @@ class PlateButton(AnimButton):
         if self.ft > 0.01:
             p.fillPath(path, QColor(255, 255, 255, int(160 * self.ft)))
         p.setPen(QPen(QColor("#080808"), 3)); p.setBrush(Qt.NoBrush); p.drawPath(path)
-        if self.t > 0.5:
+        if on and self.t > 0.5:
             p.setPen(QPen(WHITE, 2)); p.drawPath(path)
 
         h = r.height()
@@ -767,7 +788,12 @@ class SlantTab(AnimButton):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(5, 6, -5, -5)
         path = para_path(r, 16)
+        p.fillPath(path.translated(0, 3), QColor(0, 0, 0, 95))
         p.fillPath(path, lerp_color(QColor("#e5e5e5"), YELLOW, self.st))
+        p.save(); p.setClipPath(path)
+        p.fillRect(QRectF(r.left(), r.top(), r.width(), 3), QColor(255, 255, 255, 150))
+        p.fillRect(QRectF(r.left(), r.bottom() - 5, r.width(), 5), QColor(0, 0, 0, 22))
+        p.restore()
         p.setPen(QPen(QColor("#080808"), 4)); p.setBrush(Qt.NoBrush); p.drawPath(path)
         h = r.height(); fg = QColor("#111111")
         icon_rect = QRectF(r.left() + 15, r.top(), h * 0.68, h)
@@ -827,6 +853,15 @@ class Cursor(QWidget):
         if t is None or sip.isdeleted(t) or not t.isVisible():
             return None
         r = t.cursor_rect()
+        ancestor = t.parentWidget()
+        while ancestor is not None and ancestor is not self.parentWidget():
+            if isinstance(ancestor, QScrollArea):
+                viewport = ancestor.viewport()
+                origin = t.mapTo(viewport, QPoint(int(r.left()), int(r.top())))
+                visible = QRectF(origin.x(), origin.y(), r.width(), r.height())
+                if not QRectF(viewport.rect()).contains(visible):
+                    return None
+            ancestor = ancestor.parentWidget()
         tl = t.mapTo(self.parentWidget(), QPoint(int(r.left()), int(r.top())))
         return QRectF(tl.x(), tl.y(), r.width(), r.height())
 
@@ -857,12 +892,20 @@ class Cursor(QWidget):
     def _k(self, v):
         self.k = v; self.refresh()
 
-    def refresh(self):
+    def scroll_changed(self, _=None):
+        self.refresh(scrolling=True)
+
+    def refresh(self, scrolling=False):
         tr = self.target_rect()
         if tr is not None:
+            if scrolling or self.cur.isNull():
+                self.cur = self.src = QRectF(tr)
+                self.k = 1.0
             k = self.k
             self.cur = QRectF(lerp(self.src.left(), tr.left(), k), lerp(self.src.top(), tr.top(), k),
                               lerp(self.src.width(), tr.width(), k), lerp(self.src.height(), tr.height(), k))
+        else:
+            self.cur = QRectF()
         if time.monotonic() > self.follow_until and self.k >= 1.0:
             self.follow.stop()
         self.repaint_area()
@@ -889,7 +932,7 @@ class Cursor(QWidget):
         if isinstance(self.target, FighterTile):
             # P1 token resting on the tile's top-right corner, kept inside the window.
             rad = 11.5
-            c = QPointF(min(W - rad - 4, r.right() - 4), max(rad + 2, r.top() + 4 - 2 * s))
+            c = QPointF(min(self.width() - rad - 4, r.right() - 4), max(rad + 2, r.top() + 4 - 2 * s))
             p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 120)); p.drawEllipse(c + QPointF(1.5, 2), rad, rad)
             p.setPen(QPen(WHITE, 2.5)); p.setBrush(QColor("#e8141e")); p.drawEllipse(c, rad, rad)
             p.setFont(label_font(14, QFont.Black)); p.setPen(WHITE)
@@ -922,18 +965,20 @@ class Panel(QWidget):
             self._bkey, self._bpix = key, pm
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         p.drawPixmap(0, 0, self._bpix)
-        draw_streaks(p, self.width(), self.height(), self.streaks, self.phase, 1.2)
+        draw_streaks(p, self.width(), self.height(), self.streaks, self.phase, 0.35)
 
     def paint_static(self, p):
         w, h = self.width(), self.height()
-        p.fillRect(self.rect(), QColor("#e6e7e9"))
+        bg = QLinearGradient(0, 0, w, h)
+        bg.setColorAt(0, QColor("#f0f1f3")); bg.setColorAt(1, QColor("#dde0e4"))
+        p.fillRect(self.rect(), bg)
         p.setPen(Qt.NoPen)
         for i in range(6):
             x = w * i / 5
-            p.setBrush(QColor("#d3d5d9") if i % 2 else QColor("#f5f5f5"))
+            p.setBrush(QColor(30, 35, 45, 9) if i % 2 else QColor(255, 255, 255, 65))
             p.drawPolygon(QPolygonF([QPointF(x, 0), QPointF(x + w * 0.30, 0),
                                      QPointF(x - h * 0.65, h)]))
-        p.setBrush(QColor(255, 255, 255, 100))
+        p.setBrush(QColor(255, 255, 255, 55))
         p.drawPath(smash_ball_path(QPointF(w * 0.8, h * 0.65), h * 0.55))
         p.setPen(QPen(QColor("#111111"), 4)); p.drawLine(0, 2, w, 2)
 
@@ -958,7 +1003,18 @@ class DarkCard(QWidget):
         r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
         facets(p, r, "#f3f3f3", 14)
         p.save(); p.setClipPath(para_path(r, 14))
-        p.fillRect(QRectF(r.left(), r.top(), r.width(), 47), QColor("#161616"))
+        band = QRectF(r.left(), r.top(), r.width(), 47)
+        shade = QLinearGradient(band.topLeft(), band.bottomRight())
+        shade.setColorAt(0, QColor("#24252a")); shade.setColorAt(1, QColor("#111114"))
+        p.fillRect(band, shade)
+        p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 12))
+        for x in (r.right() - 108, r.right() - 72):
+            p.drawPolygon(QPolygonF([QPointF(x, r.top()), QPointF(x + 18, r.top()),
+                                     QPointF(x - 10, band.bottom()), QPointF(x - 28, band.bottom())]))
+        p.setBrush(RED_MID)
+        p.drawPolygon(QPolygonF([r.topLeft(), QPointF(r.left() + 20, r.top()),
+                                 QPointF(r.left() + 9, band.bottom()), QPointF(r.left(), band.bottom())]))
+        p.fillRect(QRectF(r.left(), band.bottom() - 2, r.width(), 2), YELLOW)
         p.restore()
         if self.title:
             p.setFont(game_font(18)); p.setPen(WHITE)
@@ -977,6 +1033,7 @@ class StatusBar(QWidget):
         store.changed.connect(self.on_change)
 
     def on_change(self):
+        self.setToolTip(self.store.save.path if self.store.loaded else "No file open")
         if self.store.dirty and not self._pulsing:
             self._pulsing = True
             tween(self, "pulse", 0, 1, 1400, self._set_pulse, QEasingCurve.Linear, loops=-1)
@@ -992,10 +1049,10 @@ class StatusBar(QWidget):
         self.desc = text; self.update()
 
     def prompts(self):
-        pad = PAD is not None and PAD.connected
-        ok, back = ("CROSS", "CIRCLE") if pad else ("ENTER", "ESC")
         win = self.window()
-        if any(isinstance(c, Overlay) and not c.closing for c in win.children()):
+        pad = win.pad.connected
+        ok, back = ("CROSS", "CIRCLE") if pad else ("ENTER", "ESC")
+        if win.overlay_open():
             return [((ok,), "CONFIRM"), ((back,), "BACK")]
         if getattr(win, "current", None) is None:
             return [((ok,), "SELECT"), ((back,), "QUIT")]
@@ -1008,10 +1065,13 @@ class StatusBar(QWidget):
         g.setColorAt(0, QColor("#1c1c22")); g.setColorAt(1, QColor("#08080a"))
         p.fillRect(self.rect(), g)
         p.setPen(QPen(QColor("#e3001b"), 3)); p.drawLine(0, 1, w, 1)
-        p.setPen(Qt.NoPen); p.setBrush(WHITE)
-        p.drawPath(smash_ball_path(QPointF(M + 20, h / 2), 15))
-        p.setPen(QPen(QColor(255, 255, 255, 150), 2)); p.drawLine(QPointF(M + 52, h - 10), QPointF(M + 60, 10))
-        box = QRectF(w - M - 330, 6, 330, h - 12)
+        compact = w < 920
+        if not compact:
+            p.setPen(Qt.NoPen); p.setBrush(WHITE)
+            p.drawPath(smash_ball_path(QPointF(M + 20, h / 2), 15))
+            p.setPen(QPen(QColor(255, 255, 255, 150), 2)); p.drawLine(QPointF(M + 52, h - 10), QPointF(M + 60, 10))
+        box_width = 128 if compact else min(330, round(w * 0.30))
+        box = QRectF(w - M - box_width, 6, box_width, h - 12)
         # button prompts, right-aligned before the file box
         x = box.left() - 18
         for keys, label in reversed(self.prompts()):
@@ -1025,28 +1085,31 @@ class StatusBar(QWidget):
             x -= 16
         msg = self.desc or self.default
         f = label_font(20, QFont.DemiBold, True)
-        avail = x - (M + 74) - 10
+        message_left = M if compact else M + 74
+        avail = max(0, x - message_left - 10)
         p.setFont(f); p.setPen(WHITE)
-        p.drawText(QRectF(M + 74, 0, avail, h), Qt.AlignVCenter | Qt.AlignLeft,
+        p.drawText(QRectF(message_left, 0, avail, h), Qt.AlignVCenter | Qt.AlignLeft,
                    QFontMetricsF(f).elidedText(msg, Qt.ElideRight, avail))
 
         bp = para_path(box, 14)
         p.fillPath(bp, QColor("#141418")); p.setBrush(Qt.NoBrush); p.setPen(silver_pen(box, 1.6, 200)); p.drawPath(bp)
-        div = box.left() + 200
-        p.setPen(QPen(QColor(255, 255, 255, 120), 1.6))
-        p.drawLine(QPointF(div + 6, box.top() + 6), QPointF(div - 2, box.bottom() - 6))
-        p.setFont(fa_font(16)); p.setPen(WHITE)
-        p.drawText(QRectF(box.left() + 18, box.top(), 26, box.height()), Qt.AlignCenter, G["open"])
+        div = box.right() - 124
         s = self.store.save
-        if s:
-            parts = s.path.split("/")
-            short = "Ryujinx · system_data.bin" if s.path == sd.RYUJINX_SAVE else "/".join(parts[-2:])
-        else:
-            short = "No file"
-        p.setFont(label_font(17)); p.setPen(WHITE if s else QColor("#8b8b95"))
-        p.drawText(QRectF(box.left() + 50, box.top(), div - box.left() - 56, box.height()), Qt.AlignVCenter | Qt.AlignLeft,
-                   QFontMetricsF(p.font()).elidedText(short, Qt.ElideLeft, div - box.left() - 56))
-        if not s:
+        if not compact:
+            p.setPen(QPen(QColor(255, 255, 255, 120), 1.6))
+            p.drawLine(QPointF(div + 6, box.top() + 6), QPointF(div - 2, box.bottom() - 6))
+            p.setFont(fa_font(16)); p.setPen(WHITE)
+            p.drawText(QRectF(box.left() + 18, box.top(), 26, box.height()), Qt.AlignCenter, G["open"])
+            short = os.path.basename(s.path) if s else "No file"
+            file_width = div - box.left() - 56
+            p.setFont(label_font(17)); p.setPen(WHITE if s else QColor("#8b8b95"))
+            p.drawText(QRectF(box.left() + 50, box.top(), file_width, box.height()), Qt.AlignVCenter | Qt.AlignLeft,
+                       QFontMetricsF(p.font()).elidedText(short, Qt.ElideLeft, file_width))
+        if self.store.busy:
+            label = {"Saving": "SAVING", "Creating backup": "BACKUP", "Exporting copy": "COPYING"}.get(
+                self.store.operation, "READING")
+            icon, color = G["clock"], YELLOW
+        elif not s:
             icon, color, label = G["question"], QColor("#8b8b95"), "NO FILE"
         elif s.dirty:
             a = 0.55 + 0.45 * (0.5 + 0.5 * math.cos(self.pulse * 2 * math.pi))
@@ -1094,11 +1157,12 @@ class Toast(QWidget):
 
     def show_toast(self, text, kind="ok", ms=2600, icon=None):
         self.text, self.kind, self.icon = text, kind, icon
+        self.setAccessibleName(text)
         if kind == "error":
             play("error")
         f = heavy_italic(24)
-        w = int(QFontMetricsF(f).horizontalAdvance(text) + 110)
-        self.setGeometry(W - w + 10, 3, w, 50)
+        w = min(self.parentWidget().width() - M, int(QFontMetricsF(f).horizontalAdvance(text) + 110))
+        self.setGeometry(self.parentWidget().width() - w + 10, 3, w, 50)
         self.show(); self.raise_()
         tween(self, "k", self.k, 1.0, 380, self._k, QEasingCurve.OutBack)
         self.timer.start(ms)
@@ -1133,7 +1197,9 @@ class Toast(QWidget):
             p.setFont(fa_font(20)); p.setPen(fg)
             p.drawText(QRectF(r.left() + 22, r.top(), 34, r.height()), Qt.AlignCenter, icon)
         p.setFont(heavy_italic(24))
-        p.drawText(QRectF(r.left() + 62, r.top(), r.width() - 70, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text)
+        width = r.width() - 78
+        text = QFontMetricsF(p.font()).elidedText(self.text, Qt.ElideRight, width)
+        p.drawText(QRectF(r.left() + 62, r.top(), width, r.height()), Qt.AlignVCenter | Qt.AlignLeft, text)
 
 
 # =========================================================== overlays ======
@@ -1147,18 +1213,19 @@ class Overlay(QWidget):
         self.win, self.title, self.glyph = win, title, glyph
         self.k = 0.0
         self.closing = False
-        self.setGeometry(0, 0, W, H)
+        self.setGeometry(win.rect())
         self.card = QWidget(self)
         self.card.paintEvent = self.paint_card
-        self.cx = (W - self.CARD_W) // 2
-        self.cy = (H - self.CARD_H) // 2 + 10
+        self.cx = (win.width() - self.CARD_W) // 2
+        self.cy = (win.height() - self.CARD_H) // 2 + 10
         self.card.setGeometry(self.cx, self.cy, self.CARD_W, self.CARD_H)
         self.setFocusPolicy(Qt.StrongFocus)
         self.prev_focus = QApplication.focusWidget()
+        self.setAccessibleName(title)
 
     def open(self):
         self.show(); self.raise_(); self.setFocus()
-        tween(self, "k", 0.0, 1.0, 420, self._k, QEasingCurve.OutBack)
+        tween(self, "k", 0.0, 1.0, 260, self._k)
         focus = self.first_focus()
         if focus:
             QTimer.singleShot(0, focus.setFocus)
@@ -1167,10 +1234,33 @@ class Overlay(QWidget):
     def first_focus(self):
         return None
 
+    def focusNextPrevChild(self, forward):
+        # QWidget handles Tab before keyPressEvent; keep its focus chain modal.
+        current = QApplication.focusWidget()
+        candidate = current if current and self.isAncestorOf(current) else self
+        start = candidate
+        while True:
+            candidate = candidate.nextInFocusChain() if forward else candidate.previousInFocusChain()
+            if candidate is start:
+                break
+            if (self.isAncestorOf(candidate) and candidate.isVisibleTo(self)
+                    and candidate.isEnabled() and candidate.focusPolicy() & Qt.TabFocus):
+                candidate.setFocus(Qt.TabFocusReason if forward else Qt.BacktabFocusReason)
+                return True
+        self.setFocus()
+        return True
+
     def _k(self, v):
         self.k = v
-        self.card.move(int(self.cx + (1 - v) * 140), self.cy)
+        self.card.move(int(self.cx + (1 - v) * 48), self.cy)
         self.update()
+
+    def resizeEvent(self, event):
+        if hasattr(self, "card"):
+            self.cx = (self.width() - self.CARD_W) // 2
+            self.cy = (self.height() - self.CARD_H) // 2 + 10
+            self._k(self.k)
+        super().resizeEvent(event)
 
     def close_overlay(self):
         if self.closing:
@@ -1184,8 +1274,7 @@ class Overlay(QWidget):
             self.win.hub.setFocus()
         else:
             self.win.setFocus()
-        if STATUS:
-            STATUS.update()
+        self.win.status.update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
@@ -1194,8 +1283,10 @@ class Overlay(QWidget):
         elif e.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.accept()
         elif e.key() in ARROWS:
-            btns = [b for b in self.card.findChildren(AnimButton) if b.focusPolicy() & Qt.TabFocus]
-            spatial_focus(self.card, btns, e.key())
+            controls = [widget for widget in self.card.findChildren(QWidget)
+                        if isinstance(widget, (AnimButton, QCheckBox)) and widget.isEnabled()
+                        and widget.isVisible() and widget.focusPolicy() & Qt.TabFocus]
+            spatial_focus(self.card, controls, e.key())
         else:
             e.accept()   # modal: never leak keys to the page below
 
@@ -1271,20 +1362,24 @@ class ConfirmOverlay(Overlay):
     def __init__(self, win, title, message, buttons, glyph=G["warn"]):
         """buttons: [(text, glyph, style, callback)] -- callbacks run after closing."""
         super().__init__(win, title, glyph)
-        lab = QLabel(message, self.card)
-        lab.setWordWrap(True); lab.setTextFormat(Qt.RichText)
-        lab.setStyleSheet("color: #191919; font-family: 'Barlow Condensed'; font-size: 21px; font-weight: 600;")
+        lab = QTextBrowser(self.card)
+        lab.setHtml(message)
+        lab.setReadOnly(True)
+        lab.setFrameShape(QTextBrowser.NoFrame)
+        lab.setStyleSheet("color: #191919; background: transparent; border: none; font-family: 'Nunito'; font-size: 16px;")
         lab.setGeometry(48, 74, self.CARD_W - 110, 120)
-        lab.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        lab.setAccessibleName("Dialog details")
 
         def wrap(cb):
             def run():
+                if self.closing:
+                    return
                 self.close_overlay()
                 if cb:
                     cb()
             return run
         self.btns = self.add_buttons([(t, g, s, wrap(cb)) for t, g, s, cb in buttons])
-        self.default = self.btns[0] if self.btns else None
+        self.default = next((b for b in self.btns if b.text() in ("CANCEL", "BACK")), self.btns[0] if self.btns else None)
 
     def first_focus(self):
         return self.default
@@ -1303,20 +1398,29 @@ class NumberOverlay(Overlay):
         glyph = item_badge_pixmap(field.key, 96) if field.key in ITEM_BADGES else field.glyph
         super().__init__(win, field.name, glyph)
         self.field, self.on_confirm = field, on_confirm
+        self.original = current
+        self.edited_value = False
+        clean = win.store.save.clean if win.store.loaded else None
+        self.saved_value = (int.from_bytes(clean[field.offset:field.offset + field.size], "little")
+                            if clean is not None else current)
         self.spin = QSpinBox(self.card)
         self.spin.setRange(0, field.maximum); self.spin.setValue(current)
         self.spin.setGroupSeparatorShown(True)
         self.spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.spin.setAlignment(Qt.AlignCenter)
         self.spin.setSingleStep(1)
+        self.spin.setAccessibleName(field.name)
+        self.spin.setToolTip(f"{field.desc} · Allowed range: 0–{field.maximum:,}")
         self.spin.setStyleSheet(
             "QSpinBox { background: white; color: #111111; border: 3px solid #111111;"
-            " border-radius: 0px; font-family: 'Barlow Condensed'; font-size: 58px; font-weight: 900;"
-            " font-style: italic; selection-background-color: #e3001b; selection-color: white; }"
+            " border-radius: 0px; font-family: 'Nunito'; font-size: 44px; font-weight: 800;"
+            " selection-background-color: #e3001b; selection-color: white; }"
             "QSpinBox:focus { border: 3px solid #e3001b; }")
         cw = self.CARD_W
         self.spin.setGeometry(150, 78, cw - 310, 92)
         self.spin.installEventFilter(self)
+        self.spin.lineEdit().textEdited.connect(self.mark_edited)
+        self.spin.valueChanged.connect(self.mark_edited)
         minus = PlateButton("", self.card, G["minus"], "red", desc=f"-{field.step:,}")
         minus.setGeometry(54, 86, 90, 78); minus.clicked.connect(lambda: self.bump(-field.step))
         plus = PlateButton("", self.card, G["plus"], "red", desc=f"+{field.step:,}")
@@ -1357,18 +1461,30 @@ class NumberOverlay(Overlay):
         play("move")
 
     def set_to(self, v):
+        self.edited_value = True
         self.spin.setValue(max(0, min(self.field.maximum, v)))
 
+    def mark_edited(self):
+        self.edited_value = True
+
     def paint_extra(self, p, r):
-        p.setFont(label_font(17, QFont.DemiBold, True)); p.setPen(QColor("#4a4a4a"))
+        p.setFont(label_font(13, QFont.DemiBold)); p.setPen(QColor("#4a4a4a"))
+        hint = f"0–{self.field.maximum:,} · \u2190/\u2192 \u00b1{self.field.step:,} · \u2191/\u2193 \u00b11"
+        if self.original > self.field.maximum:
+            hint = f"Stored value: {self.original:,} (outside range) · enter a replacement"
+        elif self.saved_value != self.original:
+            hint = f"Last saved: {self.saved_value:,} · allowed range: 0–{self.field.maximum:,}"
         p.drawText(QRectF(54, 230, self.CARD_W - 120, 24), Qt.AlignLeft | Qt.AlignVCenter,
-                   f"{self.field.desc} · max {self.field.maximum:,} · \u2190\u2192 \u00b1{self.field.step:,} · \u2191\u2193 \u00b11")
+                   hint)
 
     def accept(self):
+        if self.closing:
+            return
         self.spin.interpretText()
         v = self.spin.value()
         self.close_overlay()
-        self.on_confirm(v)
+        if self.edited_value or self.original <= self.field.maximum:
+            self.on_confirm(v)
 
 
 class ChoiceOverlay(Overlay):
@@ -1408,35 +1524,196 @@ class ChoiceOverlay(Overlay):
             self.pick(cur)
 
     def pick(self, i):
+        if self.closing:
+            return
         self.close_overlay()
         self.on_pick(i)
 
 
 class HelpOverlay(Overlay):
-    CARD_W, CARD_H = 720, 440
+    CARD_W, CARD_H = 720, 420
 
     def __init__(self, win):
         super().__init__(win, "How to use", G["help"])
-        lab = QLabel(self.card)
-        lab.setTextFormat(Qt.RichText); lab.setWordWrap(True); lab.setOpenExternalLinks(True)
-        lab.setStyleSheet("color: #191919; font-family: 'Barlow Condensed'; font-size: 19px; font-weight: 600;")
-        lab.setText(
-            "<ol style='margin-left:-20px'>"
-            "<li><b>Close the game in Ryujinx</b> (the emulator rewrites the save while it runs).</li>"
-            "<li>Your Ryujinx save opens automatically. Use <b>OPEN SAVE</b> for another file.</li>"
-            "<li>Edit anything, then press <b>SAVE</b> (Ctrl+S). Both Ryujinx slots are written.</li>"
-            "<li>Every save first makes a backup (last 20 kept) — restore them in <b>BACKUPS</b>.</li></ol>"
-            "<p><b>Keys:</b> arrows + Enter · Esc back · Q / E change section · Ctrl+O open · "
-            "Ctrl+S save · M sound on/off · F1 help<br><b>Controller:</b> D-pad / stick · "
-            "Cross = OK · Circle = back · L1 / R1 = section · Options = save · Share = help</p>"
+        lab = QTextBrowser(self.card)
+        lab.setFrameShape(QTextBrowser.NoFrame)
+        lab.setOpenExternalLinks(True)
+        lab.setAccessibleName("Instructions and keyboard shortcuts")
+        lab.setStyleSheet("color: #191919; background: transparent; font-family: 'Nunito'; font-size: 14px;")
+        lab.setHtml(
+            "<p><b>1.</b> Close the game in Ryujinx before editing.<br>"
+            "<b>2.</b> Open your system_data.bin. Edit values, then press <b>SAVE</b>.<br>"
+            "<b>3.</b> Every save backs up the disk files first (newest 20 kept).<br>"
+            "<b>4.</b> Restoring a backup loads the editor; SAVE writes it to disk.</p>"
+            "<p><b>Ctrl+O</b> open · <b>Ctrl+S</b> save · <b>Ctrl+Z</b> undo<br>"
+            "<b>Ctrl+Shift+Z</b> redo · arrows + Enter select · Esc back<br>"
+            "Q / E or Ctrl+PgUp / PgDn change section · F11 fullscreen<br>"
+            "<b>Alt+F</b> files · <b>Ctrl+Shift+S</b> export · <b>Ctrl+I</b> review changes<br>"
+            "M sound · F1 help</p>"
+            + ("<p><b>Controller connected:</b> D-pad / stick · A/Cross select · B/Circle back<br>"
+               "L1/R1 section · Start save · Select help</p>" if win.pad.connected else "")
+            + "<p>Legacy save layout: game version is <b>not verified</b>. Keep backups.</p>"
             "<p style='color:#484848'>Based on Ultimate Smasher by "
             "<a style='color:#005cad' href='https://github.com/CapitanRetraso/Ultimate-Smasher'>Capitán Retraso</a>"
             " (GPL-3.0). Editing saves can corrupt them — keep backups.</p>")
-        lab.setGeometry(46, 66, self.CARD_W - 100, 290)
+        lab.setGeometry(46, 66, self.CARD_W - 100, self.CARD_H - 150)
         self.ok = self.add_buttons([("GOT IT", G["check"], "yellow", self.close_overlay)])[0]
+        self.reduce_motion = QCheckBox("Reduce motion", self.card)
+        self.reduce_motion.setGeometry(48, self.CARD_H - 70, 250, 40)
+        self.reduce_motion.setChecked(settings.reduced_motion)
+        self.reduce_motion.setToolTip("Use static selection feedback and immediate transitions")
+        self.reduce_motion.toggled.connect(settings.set_reduced_motion)
 
     def first_focus(self):
         return self.ok
+
+
+class FilesOverlay(Overlay):
+    CARD_W, CARD_H = 720, 420
+
+    def __init__(self, win):
+        super().__init__(win, "Save files", G["open"])
+        source = win.store.save.path if win.store.loaded else "No save file open"
+        current = QLabel(self.card)
+        current.setTextFormat(Qt.PlainText)
+        current.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        current.setText(f"Open save   ·   {source}" if win.store.loaded else source)
+        current.setToolTip(source)
+        current.setAccessibleName(f"Current save: {source}")
+        current.setStyleSheet("color: #202126; font-size: 14px; font-weight: 700;")
+        current.setGeometry(48, 66, 620, 30)
+
+        heading = QLabel("Recent saves", self.card)
+        heading.setStyleSheet("color: #202126; font-size: 13px; font-weight: 700;")
+        heading.setGeometry(48, 103, 620, 22)
+        self.recent = QListWidget(self.card)
+        self.recent.setGeometry(48, 129, 620, 190)
+        self.recent.setAccessibleName("Recently opened saves")
+        self.recent.installEventFilter(self)
+        self.recent.setStyleSheet(
+            "QListWidget { background: #f3f3f3; color: #161616; border: 1px solid #81818a; font-size: 15px; }"
+            "QListWidget::item { padding: 8px 12px; }"
+            "QListWidget::item:selected { background: #ffd400; color: #111111; }"
+        )
+        for path in win.recent_files():
+            directory, name = os.path.split(path)
+            item = QListWidgetItem(f"{name}   ·   {directory}")
+            item.setToolTip(path)
+            item.setData(Qt.UserRole, path)
+            self.recent.addItem(item)
+        if not self.recent.count():
+            item = QListWidgetItem("Files opened through this editor will appear here.")
+            item.setFlags(Qt.NoItemFlags)
+            self.recent.addItem(item)
+        else:
+            self.recent.setCurrentRow(0)
+        self.recent.itemActivated.connect(self.open_recent)
+
+        def after_close(action):
+            def run():
+                if not self.closing:
+                    self.close_overlay()
+                    action()
+            return run
+
+        actions = (
+            ("OPEN", self.open_recent, "Open the selected recent save", bool(self.selected_path())),
+            ("BROWSE…", after_close(win.open_dialog), "Choose a save from disk (Ctrl+O)", True),
+            ("CHANGES", after_close(win.review_changes), "Review pending changes (Ctrl+I)", win.store.loaded),
+            ("EXPORT", after_close(win.export_copy), "Export a copy (Ctrl+Shift+S)", win.store.loaded),
+            ("BACK", self.close_overlay, "Close the file menu", True),
+        )
+        self.buttons = []
+        for i, (label, action, desc, enabled) in enumerate(actions):
+            button = PlateButton(label, self.card, style="yellow" if i == 1 else "dark", desc=desc)
+            button.setGeometry(44 + i * 127, 342, 124, 52)
+            button.setEnabled(enabled)
+            button.clicked.connect(action)
+            self.buttons.append(button)
+        self.recent.currentItemChanged.connect(lambda *_: self.buttons[0].setEnabled(bool(self.selected_path())))
+
+    def selected_path(self):
+        item = self.recent.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def first_focus(self):
+        return self.recent if self.selected_path() else self.buttons[1]
+
+    def eventFilter(self, obj, event):
+        if obj is self.recent and event.type() == event.KeyPress:
+            key = event.key()
+            if key == Qt.Key_Right or (key == Qt.Key_Down and self.recent.currentRow() == self.recent.count() - 1):
+                self.buttons[1].setFocus(Qt.TabFocusReason)
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Up and QApplication.focusWidget() in self.buttons and self.selected_path():
+            self.recent.setFocus(Qt.TabFocusReason)
+        else:
+            super().keyPressEvent(event)
+
+    def open_recent(self, _=None):
+        path = self.selected_path()
+        if path and not self.closing:
+            self.close_overlay()
+            self.win.confirm_open(lambda: self.win.load_path(path, remember=True))
+
+
+class ChangesOverlay(Overlay):
+    CARD_W, CARD_H = 720, 420
+
+    def __init__(self, win):
+        super().__init__(win, "Review changes", G["list"])
+        self.details = QTextBrowser(self.card)
+        self.details.setGeometry(48, 72, 620, 248)
+        self.details.setFrameShape(QTextBrowser.NoFrame)
+        self.details.setAccessibleName("Changes since the last saved version")
+        self.details.setStyleSheet("color: #202126; background: transparent; font-size: 15px;")
+        self.details.installEventFilter(self)
+        changes = win.store.pending_changes()
+        report = [
+            '<table width="100%" cellspacing="2" cellpadding="4">',
+            '<tr><td width="50%"><b>Field</b></td><td width="25%"><b>Saved</b></td>',
+            '<td width="25%"><b>Edited</b></td></tr>',
+        ]
+        section = None
+        for change in changes:
+            if section != change.section:
+                section = change.section
+                report.append(f'<tr><td colspan="3" bgcolor="#25252a">'
+                              f'<span style="color:white;font-weight:700">{html.escape(section)}</span></td></tr>')
+            before, after = html.escape(change.before), html.escape(change.after)
+            report.append(f"<tr><td>{html.escape(change.name)}</td><td>{before}</td>"
+                          f'<td bgcolor="#fff2a7"><b>{after}</b></td></tr>')
+        report.append("</table>")
+        self.details.setHtml("".join(report) if changes else "The editor matches the last saved version.")
+        _, self.back = self.add_buttons([
+            ("EXPORT COPY", G["save"], "yellow", self.export),
+            ("BACK", G["back"], "dark", self.close_overlay),
+        ])
+
+    def first_focus(self):
+        return self.back
+
+    def eventFilter(self, obj, event):
+        if obj is self.details and event.type() == event.KeyPress:
+            scroll = self.details.verticalScrollBar()
+            if event.key() == Qt.Key_Right or (event.key() == Qt.Key_Down and scroll.value() == scroll.maximum()):
+                self.back.setFocus(Qt.TabFocusReason)
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Up:
+            self.details.setFocus(Qt.TabFocusReason)
+        else:
+            super().keyPressEvent(event)
+
+    def export(self):
+        if not self.closing:
+            self.close_overlay()
+            self.win.export_copy()
 
 
 # ================================================================ hub ======
@@ -1473,9 +1750,10 @@ HUB_TILES = {
 }
 RAIL = [  # icon, description
     ("\uf015", "Main menu"),
-    ("\uf07c", "Open another save file (Ctrl+O)"),
+    ("\uf07c", "Files, recent saves and export"),
     ("\uf028", "Sound on / off (M)"),
     ("\uf128", "Help and controls (F1)"),
+    (G["fullscreen"], "Toggle fullscreen (F11)"),
     ("\uf011", "Quit Ultimate Smasher (Esc)"),
 ]
 
@@ -1494,9 +1772,9 @@ def text_path(text, font, center):
 class Hub(QWidget):
     """Main menu in the style of the game's home screen, fully vector drawn."""
 
-    def __init__(self, parent, on_open, info, on_back=None):
+    def __init__(self, parent, on_open, on_back=None):
         super().__init__(parent)
-        self.win, self.on_open, self.info, self.on_back = parent, on_open, info, on_back
+        self.win, self.on_open, self.on_back = parent, on_open, on_back
         self.art = pixmap("hub-art.png")
         self.tile_info = {}
         self.hover = "CHARACTERS"
@@ -1506,7 +1784,6 @@ class Hub(QWidget):
         self.intro = 1.0
         self.angle = self._angle("CHARACTERS")
         self.pulse = 0.0
-        self.busy = False
         self.clock_text = time.strftime("%H:%M")
         self._cache = self._disc = self._sel = None
         self.streaks = {name: make_streaks(i * 7 + 3, 6) for i, name in enumerate(HUB_TILES)}
@@ -1523,7 +1800,7 @@ class Hub(QWidget):
 
     def _tick(self):
         # Only the pulsing frame of the selected tile animates: repaint just that.
-        if self.hover and self.isVisible() and self.window().isActiveWindow():
+        if not settings.reduced_motion and self.hover and self.isVisible() and self.window().isActiveWindow():
             self.pulse = (self.pulse + 0.04) % 1.0
             self.update(self.view_rect(hg.TILES[self.hover].boundingRect().adjusted(-30, -30, 30, 30)))
 
@@ -1550,7 +1827,6 @@ class Hub(QWidget):
         return hg.rail_at(self.width(), self.height(), QPointF(pos), len(RAIL))
 
     def play_intro(self, ms=600):
-        self.busy = False
         tween(self, "intro", 0.0, 1.0, ms, self._intro)
 
     def _intro(self, value):
@@ -1573,6 +1849,7 @@ class Hub(QWidget):
     # ------------------------------------------------------------ input --
     def mouseMoveEvent(self, event):
         rail = self.rail_at(event.pos())
+        self.setToolTip(RAIL[rail][1] if rail is not None else HUB_TILES[self.tile_at(event.pos())][1] if self.tile_at(event.pos()) else "")
         if rail != self.rail_hover:
             self.rail_hover = rail
             if rail is not None:
@@ -1628,6 +1905,8 @@ class Hub(QWidget):
             self.set_hover(hg.NEIGHBORS[self.hover or "CHARACTERS"].get(key, self.hover or "CHARACTERS"))
         elif enter and self.hover:
             self.activate(self.hover)
+        elif key == Qt.Key_Escape and self.win.isFullScreen():
+            self.win.toggle_fullscreen()
         elif key == Qt.Key_Escape and self.on_back:
             self.on_back()
         else:
@@ -1642,7 +1921,8 @@ class Hub(QWidget):
         if i == 0:
             play("select")
         elif i == 1:
-            play("select"); win.open_dialog()
+            play("select")
+            win.show_files()
         elif i == 2:
             on = SFX.toggle() if SFX else False
             win.toast("SOUND ON" if on else "SOUND OFF")
@@ -1650,22 +1930,19 @@ class Hub(QWidget):
         elif i == 3:
             play("select"); HelpOverlay(win).open()
         elif i == 4:
+            win.toggle_fullscreen()
+        elif i == 5:
             win.ask_quit()
 
     def activate(self, name):
-        if self.busy:
+        if not self.isVisible() or self.win.overlay_open() or self.win.store.busy:
             return
         play("select")
-        tween(self, "f" + name, 1.0, 0.0, 260, lambda v: self._flash(name, v))
         if name == "SAVE":
+            tween(self, "f" + name, 1.0, 0.0, 260, lambda v: self._flash(name, v))
             self.win.save_file()
-            return
-        self.busy = True
-        QTimer.singleShot(170, lambda: self._go(name))
-
-    def _go(self, name):
-        self.busy = False
-        self.on_open(name)
+        else:
+            self.on_open(name)
 
     def _flash(self, name, value):
         self.flash[name] = value; self.update()
@@ -1857,12 +2134,15 @@ class Hub(QWidget):
         store = self.win.store
         p.setFont(label_font(34, QFont.Bold)); p.setPen(QColor("#8d8d8d"))
         name = os.path.basename(store.save.path) if store.loaded else "No save loaded"
-        p.drawText(QRectF(28, 18, 880, 64), Qt.AlignVCenter, f"ULTIMATE SMASHER   ·   {name}")
-        if store.dirty:
-            r = QRectF(700, 28, 200, 46)
+        state = store.operation.upper() if store.busy else "UNSAVED" if store.dirty else ""
+        width = 575 if state else 880
+        text = QFontMetricsF(p.font()).elidedText(f"ULTIMATE SMASHER   ·   {name}", Qt.ElideMiddle, width)
+        p.drawText(QRectF(28, 18, width, 64), Qt.AlignVCenter, text)
+        if state:
+            r = QRectF(630, 28, 270, 46)
             p.setPen(Qt.NoPen); p.setBrush(YELLOW); p.drawRoundedRect(r, 23, 23)
             p.setFont(label_font(30, QFont.Bold)); p.setPen(QColor("#111111"))
-            p.drawText(r, Qt.AlignCenter, "UNSAVED")
+            p.drawText(r, Qt.AlignCenter, state)
 
     def static_layer(self, size, dpr):
         key = (size.width(), size.height(), dpr, self.hover, self.win.store.dirty)
@@ -1913,7 +2193,20 @@ class Page(QWidget):
     def __init__(self, app, parent):
         super().__init__(parent)
         self.app = app
+        self._layout_ready = False
         self.setGeometry(0, 8, W, PANEL_H - 8)
+
+    def finish_layout(self):
+        self._layout_ready = True
+        self.layout_content()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._layout_ready:
+            self.layout_content()
+
+    def layout_content(self):
+        pass
 
     @property
     def save(self):
@@ -1924,19 +2217,9 @@ class Page(QWidget):
             b.update()
 
 
-def grid(page, specs, cols, top, bh, gap_x=14, gap_y=24):
-    """Lay out SlantButtons; returns them."""
-    bw = (W - 2 * M - (cols - 1) * gap_x) / cols
-    made = []
-    for i, (text, kw) in enumerate(specs):
-        r, c = divmod(i, cols)
-        b = SlantButton(text, page, **kw)
-        b.setGeometry(int(M + c * (bw + gap_x)) - 10, int(top + r * (bh + gap_y)) - 10, int(bw) + 20, bh + 20)
-        made.append(b)
-    px = min(b.label_fit() for b in made)
-    for b in made:
-        b.label_px = px
-    return made
+def button_row(page, specs):
+    """Create a row of buttons; the page owns its responsive geometry."""
+    return [SlantButton(text, page, **kw) for text, kw in specs]
 
 
 class GeneralPage(Page):
@@ -1944,28 +2227,45 @@ class GeneralPage(Page):
         super().__init__(app, parent)
         self.by_field = {}
         num = lambda f: (f.name, {"glyph": f.glyph, "value": lambda f=f: self.fmt(f), "desc": f.desc})
-        bh, gy, top = 70, 22, 34
-        row1 = grid(self, [num(sd.GOLD), num(sd.SP)], 2, top, bh)
-        row2 = grid(self, [num(sd.HAMMERS), num(sd.TICKETS),
-                           ("Language", {"glyph": G["language"], "value": self.lang_name, "desc": "Game language"})],
-                    3, top + bh + gy, bh)
-        row3 = grid(self, [("Milestones", {"glyph": G["milestones"], "value": lambda: self.pct(self.save.milestones_progress()),
+        row1 = button_row(self, [num(sd.GOLD), num(sd.SP)])
+        row2 = button_row(self, [num(sd.HAMMERS), num(sd.TICKETS),
+                           ("Language", {"glyph": G["language"], "value": self.lang_name, "desc": "Game language"})])
+        row3 = button_row(self, [("Milestones", {"glyph": G["milestones"], "value": lambda: self.pct(self.save.milestones_progress()),
                                                "desc": "Unlock every milestone"}),
                            ("Mii Clothes", {"glyph": G["mii"], "value": lambda: self.pct(self.save.mii_clothes_progress()),
-                                                "desc": "Unlock every Mii Fighter outfit and hat"})],
-                    2, top + 2 * (bh + gy), bh)
+                                                "desc": "Unlock every Mii Fighter outfit and hat"})])
         btns = row1 + row2[:2]
         for f, b in zip([sd.GOLD, sd.SP, sd.HAMMERS, sd.TICKETS], btns):
             b.clicked.connect(lambda _=False, f=f, b=b: self.edit_number(f, b))
             self.by_field[f.key] = b
         self.lang = row2[2]
+        self.lang.setText("Game lang.")
+        self.lang.setToolTip("Language stored in the save. The editor interface is in English.")
         self.miles, self.mii = row3
-        px = min(b.label_px for b in row1 + row2 + row3)
-        for b in row1 + row2 + row3:
-            b.label_px = px
         self.lang.clicked.connect(self.pick_language)
         self.miles.clicked.connect(lambda: self.bulk(self.miles, "unlock_milestones", "milestones_progress", "ALL MILESTONES UNLOCKED"))
         self.mii.clicked.connect(lambda: self.bulk(self.mii, "unlock_mii_clothes", "mii_clothes_progress", "ALL MII CLOTHES UNLOCKED"))
+        self.rows = (row1, row2, row3)
+        self.context = QLabel(self)
+        self.context.setWordWrap(True)
+        self.context.setStyleSheet(f"color: {tokens.colors.muted}; font-size: 13px;")
+        self.context.setText("Click a value to edit. Progress counts save flags. Game version is not identified by this legacy layout.")
+        self.finish_layout()
+
+    def layout_content(self):
+        top = 24 if self.height() >= 350 else 12
+        step = min(92, (self.height() - top - 38) // len(self.rows))
+        for r, buttons in enumerate(self.rows):
+            bw = (self.width() - 2 * M - (len(buttons) - 1) * 14) / len(buttons)
+            for c, button in enumerate(buttons):
+                button.setGeometry(round(M + c * (bw + 14)) - 10, top + r * step, round(bw) + 20, step - 2)
+        px = min(b.label_fit() for row in self.rows for b in row)
+        for row in self.rows:
+            for button in row:
+                button.label_px = px
+                button.update()
+        info_y = top + len(self.rows) * step
+        self.context.setGeometry(M, info_y, self.width() - 2 * M, self.height() - info_y - 6)
 
     def fmt(self, f):
         return f"{self.save.value(f):,}" if self.save else ""
@@ -1979,12 +2279,12 @@ class GeneralPage(Page):
     @staticmethod
     def pct(progress):
         on, total = progress
-        return "100%" if on == total else f"{100 * on // total}%"
+        return f"{100 * on // total}% · {on}/{total}"
 
     def edit_number(self, f, btn):
         def done(v):
             if v != self.save.value(f):
-                self.app.store.edit(lambda s: s.set_value(f, v))
+                self.app.store.edit(lambda s: s.set_value(f, v), label=f"Set {f.name}")
                 btn.pulse()
                 self.app.toast(f"{f.name.upper()} SET TO {v:,}")
         NumberOverlay(self.app, f, self.save.value(f), done).open()
@@ -1992,19 +2292,24 @@ class GeneralPage(Page):
     def pick_language(self):
         def done(i):
             if i != self.save.language:
-                self.app.store.edit(lambda s: setattr(s, "language", i))
+                self.app.store.edit(lambda s: setattr(s, "language", i), label="Change game language")
                 self.lang.pulse()
                 self.app.toast(f"LANGUAGE: {sd.LANGUAGES[i].upper()}")
-        ChoiceOverlay(self.app, "Language", G["language"], sd.LANGUAGES, self.save.language, done).open()
+        ChoiceOverlay(self.app, "Game language", G["language"], sd.LANGUAGES, self.save.language, done).open()
 
     def bulk(self, btn, action, progress, msg):
         on, total = getattr(self.save, progress)()
         if on == total:
             self.app.toast("ALREADY COMPLETE")
             return
-        self.app.store.edit(lambda s: getattr(s, action)())
-        btn.pulse()
-        self.app.toast(msg)
+        def apply():
+            self.app.store.edit(lambda s: getattr(s, action)(), label=f"Unlock {btn.text()}")
+            btn.pulse()
+            self.app.toast(msg + " · CTRL+Z TO UNDO")
+        ConfirmOverlay(self.app, f"Unlock {btn.text()}?",
+                       f"Set the remaining <b>{total - on}</b> of <b>{total}</b> save flags. "
+                       "This changes the editor only; use Ctrl+Z to undo.",
+                       [("UNLOCK", G["unlock"], "yellow", apply), ("CANCEL", G["back"], "dark", None)]).open()
 
 
 ITEM_GROUPS = [  # header, item keys
@@ -2015,6 +2320,23 @@ ITEM_GROUPS = [  # header, item keys
 ]
 
 
+class InventoryBody(QWidget):
+    """Scrollable inventory group headings share geometry with the item tiles."""
+
+    def __init__(self, page):
+        super().__init__()
+        self.page = page
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        for title, y in self.page.headers:
+            p.setFont(heavy_italic(19)); p.setPen(QColor(tokens.colors.ink))
+            p.drawText(QRectF(6, y, self.width() - 12, 24), Qt.AlignVCenter | Qt.AlignLeft, title)
+            x = QFontMetricsF(p.font()).horizontalAdvance(title) + 16
+            p.setPen(QPen(QColor(tokens.colors.ink), 1.5))
+            p.drawLine(QPointF(x, y + 13), QPointF(self.width() - 6, y + 13))
+
+
 class ItemTile(AnimButton):
     """Inventory slot: big badge, short name and the amount owned."""
     previewed = pyqtSignal(object)
@@ -2022,6 +2344,7 @@ class ItemTile(AnimButton):
 
     def __init__(self, field, page):
         super().__init__(page, field.name, field.desc)
+        self.setToolTip(f"{field.name} — {field.desc}")
         self.field, self.page = field, page
         self.selected = False
 
@@ -2036,9 +2359,10 @@ class ItemTile(AnimButton):
 
     def focusInEvent(self, e):
         super().focusInEvent(e); self.previewed.emit(self.field)
+        self.page.scroll.ensureWidgetVisible(self, 4, 10)
 
     def cache_key(self):
-        return super().cache_key() + (self.page.amount(self.field), self.selected)
+        return super().cache_key() + (self.page.amount(self.field), self.selected, self.page.modified(self.field))
 
     def draw(self, p):
         r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
@@ -2046,21 +2370,24 @@ class ItemTile(AnimButton):
         path = para_path(r, self.SLANT)
         p.fillPath(para_path(r.translated(2, 3), self.SLANT), QColor(0, 0, 0, 55))
         g = QLinearGradient(r.topLeft(), r.bottomLeft())
-        g.setColorAt(0, QColor("#2a8cf0" if self.selected else "#1f6fd1"))
-        g.setColorAt(1, QColor("#0a4aa6" if self.selected else "#0b3f8c"))
+        g.setColorAt(0, QColor("#ffffff")); g.setColorAt(1, QColor("#dce3e6"))
         p.fillPath(path, g)
         if self.ft > 0.01:
             p.fillPath(path, QColor(255, 244, 160, int(170 * self.ft)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(WHITE if self.selected else QColor("#0c0c0c"), 2.5)); p.drawPath(path)
-        d = min(r.width() * 0.7, r.height() * 0.66)
-        disc = QRectF(r.center().x() - d / 2, r.top() + r.height() * 0.06, d, d)
+        p.setPen(QPen(YELLOW if self.selected else QColor(tokens.colors.border), 3 if self.selected else 2)); p.drawPath(path)
+        p.save(); p.setClipPath(path)
+        p.fillRect(QRectF(r.left(), r.top(), r.width(), 19), QColor(tokens.colors.panel))
+        p.restore()
+        d = 44
+        disc = QRectF(r.center().x() - d / 2, r.top() + 25, d, d)
         draw_item_badge(p, disc, self.field.key)
         val = f"{self.page.amount(self.field):,}"
-        chip = QRectF(r.left() + r.width() * 0.16, r.bottom() - r.height() * 0.26, r.width() * 0.68, r.height() * 0.22)
-        p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 150)); p.drawPolygon(para(chip, 6))
-        p.setFont(fit_font(heavy_italic, val, chip.width() - 10, chip.height() * 1.05, 9))
-        p.setPen(YELLOW); p.drawText(chip, Qt.AlignCenter, val)
+        p.setFont(label_font(13, QFont.Black)); p.setPen(YELLOW if self.page.modified(self.field) else WHITE)
+        p.drawText(QRectF(r.left() + 6, r.top(), r.width() - 14, 19), Qt.AlignVCenter | Qt.AlignRight, val)
+        p.setFont(label_font(12, QFont.Bold)); p.setPen(QColor(tokens.colors.ink))
+        p.drawText(QRectF(r.left() + 6, r.bottom() - 35, r.width() - 12, 34),
+                   Qt.AlignCenter | Qt.TextWordWrap, self.field.name)
 
 
 class ItemsPage(Page):
@@ -2069,49 +2396,89 @@ class ItemsPage(Page):
     def __init__(self, app, parent):
         super().__init__(app, parent)
         fields = {f.key: f for f in sd.ITEMS}
-        self.split = W * 0.62
-        cols, gap = 7, 8
-        tw = (self.split - M - (cols - 1) * gap) / cols
-        head, row_gap = 26, 10
-        th = min(tw * 0.92, (self.height() - 3 * (head + row_gap) - 14) / 3)
         self.headers = []
+        self.inventory_title = QLabel("INVENTORY", self)
+        self.inventory_title.setStyleSheet(
+            "color: #111114; font-family: 'Barlow Condensed'; font-size: 22px; font-weight: 900; font-style: italic;")
+        self.scroll = QScrollArea(self)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        self.inventory_body = InventoryBody(self)
+        self.scroll.setWidget(self.inventory_body)
+        self.scroll.viewport().installEventFilter(self)
         self.btns, self.by_key = [], {}
-        y = 10
-        for title, keys in ITEM_GROUPS:
-            self.headers.append((title, y))
-            y += head
-            for i, key in enumerate(keys):
+        for _, keys in ITEM_GROUPS:
+            for key in keys:
                 t = ItemTile(fields[key], self)
-                t.setGeometry(round(M + i * (tw + gap)), round(y), round(tw), round(th))
+                t.setParent(self.inventory_body)
                 t.previewed.connect(self.preview)
                 t.clicked.connect(lambda _=False, f=fields[key]: self.edit_number(f))
                 self.by_key[key] = t
-            y += th + row_gap
         self.btns = [self.by_key[f.key] for f in sd.ITEMS]
         self.current = sd.ITEMS[0]
         self.by_key[self.current.key].selected = True
         # detail panel
-        px = self.split + 18
-        pw = W - M - px
-        self.panel = QRectF(px, 10, pw, self.height() - 22)
-        by = self.panel.bottom() - 70
-        bw = (pw - 2 * 12 - 30) / 3
         self.minus = PlateButton("", self, G["minus"], "dark", desc="One less (−)")
         self.plus = PlateButton("", self, G["plus"], "dark", desc="One more (+)")
         self.maxone = PlateButton("MAX", self, "", "yellow", desc="Set this item to the maximum")
-        for i, b in enumerate((self.minus, self.plus, self.maxone)):
-            b.setGeometry(round(px + 15 + i * (bw + 12)), round(by), round(bw), 54)
         self.mx = PlateButton("MAX ALL", self, G["bolt"], "yellow", desc="Set every item and snack to the maximum")
-        self.mx.setGeometry(round(self.split - 170), 4, 170, 40)
         for b in (self.minus, self.plus):
             b.setAutoRepeat(True); b.setAutoRepeatDelay(350); b.setAutoRepeatInterval(60)
         self.minus.clicked.connect(lambda: self.bump(-1))
         self.plus.clicked.connect(lambda: self.bump(1))
         self.maxone.clicked.connect(lambda: self.set_amount(self.current, self.current.maximum))
         self.mx.clicked.connect(self.max_all)
+        self.finish_layout()
+
+    def layout_content(self):
+        self.split = self.width() * 0.62
+        self.inventory_title.setGeometry(M, 5, 180, 34)
+        self.scroll.setGeometry(M - 8, 46, round(self.split - M + 8), self.height() - 58)
+        self.layout_inventory()
+        px = self.split + 18
+        pw = self.width() - M - px
+        self.panel = QRectF(px, 10, pw, self.height() - 22)
+        compact = self.panel.height() < 300
+        action_h = 42 if compact else 54
+        action_y = round(self.panel.bottom()) - action_h - 12
+        bw = (pw - 54) / 3
+        for i, button in enumerate((self.minus, self.plus, self.maxone)):
+            button.setGeometry(round(px + 15 + i * (bw + 12)), action_y, round(bw), action_h)
+        self.mx.setGeometry(round(self.split - 170), 4, 170, 40)
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and event.type() == event.Resize and self._layout_ready:
+            self.layout_inventory()
+        return super().eventFilter(obj, event)
+
+    def layout_inventory(self):
+        width = max(108, self.scroll.viewport().width())
+        self.columns = max(1, min(7, (width - 8 + 8) // 116))
+        tw = (width - 8 - (self.columns - 1) * 8) / self.columns
+        self.headers = []
+        y = 0
+        for title, keys in ITEM_GROUPS:
+            self.headers.append((title, y))
+            y += 26
+            for i, key in enumerate(keys):
+                row, col = divmod(i, self.columns)
+                self.by_key[key].setGeometry(round(4 + col * (tw + 8)), y + row * 124, round(tw), 116)
+            y += math.ceil(len(keys) / self.columns) * 124 + 12
+        self.inventory_body.setFixedSize(width, max(self.scroll.viewport().height(), y))
+        focus = QApplication.focusWidget()
+        if isinstance(focus, ItemTile) and focus.page is self:
+            self.scroll.ensureWidgetVisible(focus, 4, 10)
+        self.inventory_body.update()
 
     def amount(self, f):
         return self.save.value(f) if self.save else 0
+
+    def modified(self, f):
+        return bool(self.save and self.save.data[f.offset:f.offset + f.size] != self.save.clean[f.offset:f.offset + f.size])
 
     def preview(self, f):
         if f is self.current:
@@ -2121,6 +2488,7 @@ class ItemsPage(Page):
         self.current = f
         self.by_key[f.key].selected = True
         self.by_key[f.key].update()
+        self.sync_controls()
         self.update(self.panel.toAlignedRect().adjusted(-4, -4, 4, 4))
 
     def set_amount(self, f, v):
@@ -2128,7 +2496,7 @@ class ItemsPage(Page):
             return
         v = max(0, min(f.maximum, v))
         if v != self.save.value(f):
-            self.app.store.edit(lambda s: s.set_value(f, v))
+            self.app.store.edit(lambda s: s.set_value(f, v), label=f"Set {f.name}")
             self.by_key[f.key].pulse()
         self.update(self.panel.toAlignedRect())
 
@@ -2154,46 +2522,68 @@ class ItemsPage(Page):
         NumberOverlay(self.app, f, self.save.value(f), done).open()
 
     def max_all(self):
+        count = sum(self.amount(f) != f.maximum for f in sd.ITEMS)
+        if not count:
+            self.app.toast("ALL ITEMS ARE ALREADY AT MAXIMUM")
+            return
+        ConfirmOverlay(self.app, "Max all items?",
+                       f"Set <b>{count}</b> of the <b>{len(sd.ITEMS)}</b> supported snack and Spirit Board quantities "
+                       "to their individual limits. Other save fields are unchanged. Use Ctrl+Z to undo this action.",
+                       [("MAX ALL", G["bolt"], "yellow", self.apply_max_all),
+                        ("CANCEL", G["back"], "dark", None)]).open()
+
+    def apply_max_all(self):
         def run(s):
             for f in sd.ITEMS:
                 s.set_value(f, f.maximum)
-        self.app.store.edit(run)
+        self.app.store.edit(run, label="Max all items")
         for i, b in enumerate(self.btns):
             QTimer.singleShot(i * 35, b.pulse)
-        self.app.toast("ALL ITEMS MAXED")
+        self.app.toast("ALL ITEMS MAXED · CTRL+Z TO UNDO")
+
+    def sync_controls(self):
+        amount = self.amount(self.current)
+        self.minus.setEnabled(amount > 0)
+        self.plus.setEnabled(amount < self.current.maximum)
+        self.maxone.setEnabled(amount < self.current.maximum)
+        count = sum(self.amount(f) != f.maximum for f in sd.ITEMS)
+        self.mx.setToolTip(f"Max all: {count} quantities will change. Ctrl+Z undoes the action.")
 
     def refresh(self):
-        super().refresh(); self.update()
+        self.sync_controls()
+        changed = sum(self.modified(field) for field in sd.ITEMS)
+        self.inventory_title.setText(f"INVENTORY   ·   {changed} CHANGED" if changed else "INVENTORY")
+        super().refresh()
+        self.update()
 
     def paintEvent(self, _):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        for title, y in self.headers:
-            p.setFont(heavy_italic(19)); p.setPen(QColor("#1b1b1f"))
-            p.drawText(QRectF(M + 4, y, 300, 24), Qt.AlignVCenter | Qt.AlignLeft, title)
-            fm = QFontMetricsF(p.font())
-            x0 = M + 14 + fm.horizontalAdvance(title)
-            x1 = self.split - (182 if y == self.headers[0][1] else 6)
-            p.setPen(QPen(QColor("#1b1b1f"), 2)); p.drawLine(QPointF(x0, y + 13), QPointF(x1, y + 13))
         # detail panel
         r = self.panel
         facets(p, r, "#16171b", 16)
         f = self.current
-        d = min(r.width() * 0.34, r.height() * 0.32)
-        disc = QRectF(r.center().x() - d / 2, r.top() + 20, d, d)
+        compact = r.height() < 300
+        description_h = 38 if compact else 44
+        title_h = 30 if compact else 36
+        d = min(r.width() * 0.34, r.height() * 0.32, max(36, r.height() - (200 if compact else 246)))
+        disc = QRectF(r.center().x() - d / 2, r.top() + (13 if compact else 20), d, d)
         p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 18)); p.drawEllipse(disc.adjusted(-14, -14, 14, 14))
         draw_item_badge(p, disc, f.key)
-        y = disc.bottom() + 16
+        y = disc.bottom() + (10 if compact else 16)
         p.setFont(fit_font(heavy_italic, f.name.upper(), r.width() - 60, 32)); p.setPen(WHITE)
-        p.drawText(QRectF(r.left() + 20, y, r.width() - 40, 36), Qt.AlignCenter, f.name.upper())
-        p.setFont(label_font(17, QFont.DemiBold)); p.setPen(QColor("#b8b8c0"))
-        p.drawText(QRectF(r.left() + 30, y + 36, r.width() - 60, 44), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, f.desc)
+        p.drawText(QRectF(r.left() + 20, y, r.width() - 40, title_h), Qt.AlignCenter, f.name.upper())
+        p.setFont(label_font(14 if compact else 17, QFont.DemiBold)); p.setPen(QColor("#b8b8c0"))
+        p.drawText(QRectF(r.left() + 24, y + title_h, r.width() - 48, description_h), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, f.desc)
         val = f"{self.amount(f):,}"
-        bottom = r.bottom() - 84
-        chip = QRectF(r.left() + 34, max(y + 82, bottom - 66), r.width() - 68, min(66, bottom - y - 82))
+        bottom = self.minus.y() - 8
+        top = max(y + title_h + description_h, bottom - 66)
+        chip = QRectF(r.left() + 30, top, r.width() - 60, max(0, bottom - top))
+        if chip.isEmpty():
+            return
         p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 170)); p.drawPolygon(para(chip, 14))
         p.setFont(fit_font(heavy_italic, val, chip.width() * 0.6, chip.height() * 0.85, 14)); p.setPen(YELLOW)
-        p.drawText(chip, Qt.AlignCenter, val)
+        p.drawText(chip.adjusted(16, 0, -74, 0), Qt.AlignCenter, val)
         p.setFont(label_font(13, QFont.Bold)); p.setPen(QColor("#8a8a92"))
         p.drawText(chip.adjusted(0, 0, -20, -4), Qt.AlignRight | Qt.AlignBottom, f"MAX {f.maximum:,}")
 
@@ -2211,6 +2601,8 @@ class FighterTile(AnimButton):
         self._gray = {}
         self.unlocked = True
         self.pop = 0.0
+        self.selected = False
+        self.page = None
 
     def art(self, kind):
         """Portrait or render, grey when locked; loaded lazily (only one is shown at a time)."""
@@ -2228,6 +2620,8 @@ class FighterTile(AnimButton):
     def focusInEvent(self, event):
         super().focusInEvent(event)
         self.previewed.emit(self.idx)
+        if self.page is not None:
+            self.page.scroll.ensureWidgetVisible(self, 6, 6)
 
     def cursor_rect(self):
         return QRectF(self.rect()).adjusted(1, 1, -1, -1)
@@ -2239,8 +2633,11 @@ class FighterTile(AnimButton):
         changed = unlocked != self.unlocked
         self.unlocked = unlocked
         self.desc = f"{self.title} — {'unlocked (click to lock)' if unlocked else 'locked (click to unlock)'}"
-        if STATUS and (self.underMouse() or self.hasFocus()):
-            STATUS.describe(self.desc)
+        self.setToolTip(self.desc)
+        self.setAccessibleDescription(self.desc)
+        status = getattr(self.window(), "status", None)
+        if status and (self.underMouse() or self.hasFocus()):
+            status.describe(self.desc)
         if animate and changed:
             tween(self, "pop", 1.0, 0.0, 420, self._set("pop"), QEasingCurve.OutQuad, delay=delay)
             if delay:
@@ -2248,30 +2645,41 @@ class FighterTile(AnimButton):
         self.update()
 
     def cache_key(self):
-        return super().cache_key() + (self.unlocked,)
+        return super().cache_key() + (self.unlocked, self.selected)
 
     def draw(self, p):
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        band = max(10.0, r.height() * 0.27)
-        face = QRectF(r.left(), r.top(), r.width(), r.height() - band)
+        band = max(22.0, r.height() * 0.24)
+        face = QRectF(r)
         p.fillRect(r, QColor("#111111"))
         pm = self.art("portrait")
         p.drawPixmap(face, pm, portrait_source(pm, face.width() / face.height()))
         if not self.unlocked:
-            p.fillRect(face, QColor(10, 10, 14, 150))
-            p.setFont(fa_font(face.height() * 0.42)); p.setPen(QColor(255, 255, 255, 220))
-            p.drawText(face, Qt.AlignCenter, G["lock"])
+            p.fillRect(face, QColor(10, 10, 14, 70))
+            lock_rect = QRectF(r.right() - 24, r.top() + 4, 20, 20)
+            p.fillRect(lock_rect, QColor(0, 0, 0, 190))
+            p.setFont(fa_font(13)); p.setPen(WHITE)
+            p.drawText(lock_rect, Qt.AlignCenter, G["lock"])
         if self.pop > 0.01:
             p.fillRect(r, QColor(255, 240, 150, int(180 * self.pop)))
-        nb = QRectF(r.left(), face.bottom(), r.width(), band)
-        p.fillRect(nb, QColor("#0c0c0c"))
+        nb = QRectF(r.left(), r.bottom() - band, r.width(), band)
+        shade = QLinearGradient(nb.topLeft(), nb.bottomLeft())
+        shade.setColorAt(0, QColor(0, 0, 0, 0)); shade.setColorAt(1, QColor(0, 0, 0, 190))
+        p.fillRect(nb, shade)
         name = self.title.upper()
-        p.setFont(fit_font(lambda px: label_font(px, QFont.Bold), name, nb.width() - 6, band * 0.95, 7))
-        p.setPen(WHITE if self.unlocked else QColor("#8a8a8a"))
-        p.drawText(nb, Qt.AlignCenter, name)
+        font = fit_font(lambda px: round_font(px, QFont.Black), name, nb.width() - 8, min(20, band * 0.72), 10)
+        name_path = text_path(name, font, nb.center())
+        p.setPen(QPen(QColor("#080808"), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush); p.drawPath(name_path); p.fillPath(name_path, WHITE)
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(YELLOW if self.t > 0.5 else QColor("#000000"), 3 if self.t > 0.5 else 1))
-        p.drawRect(r)
+        if self.selected:
+            # The selected fighter stays marked even when focus moves to search.
+            frame = r.adjusted(2, 2, -2, -2)
+            p.setPen(QPen(RED_TOP, 6)); p.drawRect(frame)
+            p.setPen(QPen(YELLOW, 2)); p.drawRect(frame)
+        else:
+            p.setPen(QPen(WHITE if self.t > 0.5 else QColor("#000000"), 2 if self.t > 0.5 else 1))
+            p.drawRect(r)
 
 
 class CharactersPage(Page):
@@ -2279,39 +2687,123 @@ class CharactersPage(Page):
 
     def __init__(self, app, parent):
         super().__init__(app, parent)
-        n = len(sd.FIGHTERS)
-        rows = math.ceil(n / self.COLS)
-        gap = 1
-        tw = (W - 16 - (self.COLS - 1) * gap) / self.COLS
-        th = min(tw * 62 / 94, (self.height() - 148) / rows - gap)
-        top = 4
-        x0 = 8
+        self.search = QLineEdit(self)
+        self.search.setPlaceholderText("Search base fighters…")
+        self.search.setAccessibleName("Search base fighters by name")
+        self.search.setClearButtonEnabled(True)
+        self.search.setStyleSheet(
+            "QLineEdit { background: #f4f4f4; color: #111; border: 2px solid #111;"
+            "font-family: 'Nunito'; font-size: 15px; padding: 4px 10px; }"
+            "QLineEdit:focus { border-color: #ffd400; }")
+        self.filter = QComboBox(self)
+        self.filter.addItems(["All base fighters", "Locked", "Unlocked", "Changed"])
+        self.filter.setAccessibleName("Filter fighters by unlock state or pending changes")
+        filter_arrow = os.path.join(IMG, "ui", "chevron-down.svg")
+        self.filter.setStyleSheet(
+            "QComboBox { background: #ffd400; color: #111; border: 2px solid #111;"
+            "font-family: 'Nunito'; font-size: 14px; font-weight: 800; padding: 4px 28px 4px 8px; }"
+            "QComboBox::drop-down { width: 24px; border-left: 2px solid #111; }"
+            f'QComboBox::down-arrow {{ image: url("{filter_arrow}"); width: 12px; height: 8px; }}'
+            "QComboBox QAbstractItemView { background: #f4f4f4; color: #111;"
+            "selection-background-color: #ffd400; selection-color: #111; }")
+        self.results = QLabel(self)
+        self.results.setStyleSheet("color: #ddd; font-family: 'Nunito'; font-size: 13px; font-weight: 700;")
+        self.results.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.scroll = QScrollArea(self)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.scroll.setStyleSheet("QScrollArea { background: #08090b; border: none; }")
+        self.roster_body = QWidget()
+        self.roster_body.setStyleSheet("background: #08090b;")
+        self.scroll.setWidget(self.roster_body)
+        self.scroll.viewport().installEventFilter(self)
+        self.empty = QLabel("No matching fighters. Clear the search or change the filter.", self.roster_body)
+        self.empty.setWordWrap(True)
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.empty.setStyleSheet("color: white; font-family: 'Nunito'; font-size: 16px; padding: 12px;")
         self.tiles = []
         self.selected_idx = 0
-        last = n - (rows - 1) * self.COLS
+        self.visible_tiles = []
         for i, (name, img) in enumerate(sd.FIGHTERS):
-            r, c = divmod(i, self.COLS)
-            x = x0 + c * (tw + gap)
-            if r == rows - 1:
-                x += (self.COLS - last) * (tw + gap) / 2
-            tile = FighterTile(i, name, img, self)
-            tile.setGeometry(round(x), round(top + r * (th + gap)), round(tw), round(th))
+            tile = FighterTile(i, name, img, self.roster_body)
+            tile.page = self
             tile.setAccessibleName(name)
             tile.previewed.connect(self.preview)
             tile.clicked.connect(lambda _=False, i=i: self.toggle(i))
             self.tiles.append(tile)
-        self.bar_y = int(top + rows * (th + gap) + 7)
         self.count_txt = ""
         self.unlock_all = PlateButton("UNLOCK ALL", self, G["unlock"], "yellow", desc="Unlock all 71 base fighters")
-        self.unlock_all.setGeometry(W - 275, self.bar_y + 6, 265, 58)
-        self.unlock_all.clicked.connect(lambda: self.set_all(True))
+        self.unlock_all.clicked.connect(lambda: self.confirm_set_all(True))
         self.lock_all = PlateButton("LOCK ALL", self, G["lock"], "dark", desc="Lock every fighter on the roster")
-        self.lock_all.setGeometry(W - 275, self.bar_y + 66, 265, 52)
-        self.lock_all.clicked.connect(self.confirm_lock_all)
+        self.lock_all.clicked.connect(lambda: self.confirm_set_all(False))
+        self.search.textChanged.connect(self.apply_filter)
+        self.filter.currentIndexChanged.connect(self.apply_filter)
+        self.apply_filter()
+        self.finish_layout()
+
+    def layout_content(self):
+        detail_height = max(136, min(260, round(self.height() * 0.25)))
+        self.bar_y = max(108, self.height() - detail_height)
+        search_w = max(230, round(self.width() * 0.42))
+        self.search.setGeometry(10, 7, search_w, 36)
+        self.filter.setGeometry(search_w + 22, 7, 180, 36)
+        self.results.setGeometry(search_w + 214, 7, max(80, self.width() - search_w - 226), 36)
+        self.scroll.setGeometry(8, 50, self.width() - 16, self.bar_y - 55)
+        self.layout_roster()
+        actions_w = min(265, round(self.width() * 0.26))
+        self.unlock_all.setGeometry(self.width() - actions_w - 10, self.bar_y + 6, actions_w, 58)
+        self.lock_all.setGeometry(self.unlock_all.x(), self.bar_y + 66, actions_w, 52)
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and event.type() == event.Resize and self._layout_ready:
+            self.layout_roster()
+        return super().eventFilter(obj, event)
+
+    def layout_roster(self):
+        width = max(104, self.scroll.viewport().width())
+        self.columns = min(self.COLS, max(1, width // 106))
+        tw = (width - (self.columns - 1) * 2) / self.columns
+        th = max(76, min(108, round(tw * 62 / 94)))
+        rows = math.ceil(len(self.visible_tiles) / self.columns)
+        self.roster_body.setFixedSize(width, max(self.scroll.viewport().height(), rows * (th + 2)))
+        for i, tile in enumerate(self.visible_tiles):
+            row, col = divmod(i, self.columns)
+            last = len(self.visible_tiles) - row * self.columns
+            offset = (width - (last * (tw + 2) - 2)) / 2 if last < self.columns else 0
+            tile.setGeometry(round(offset + col * (tw + 2)), row * (th + 2), round(tw), th)
+        self.empty.setGeometry(0, 0, width, max(100, self.scroll.viewport().height()))
+
+    def apply_filter(self, *_):
+        focus = QApplication.focusWidget()
+        query = search_key(self.search.text())
+        state = self.filter.currentIndex()
+        self.visible_tiles = []
+        for tile in self.tiles:
+            if state == 3:
+                offset = sd.fighter_offset(tile.idx)
+                show_state = bool(self.save and self.save.data[offset] != self.save.clean[offset])
+            else:
+                show_state = state == 0 or tile.unlocked == (state == 2)
+            match = query in search_key(tile.title) and show_state
+            tile.setVisible(match)
+            if match:
+                self.visible_tiles.append(tile)
+        count = len(self.visible_tiles)
+        self.results.setText(f"{count} / {len(self.tiles)} base fighters")
+        self.empty.setVisible(count == 0)
+        self.layout_roster()
+        if focus in self.tiles and focus not in self.visible_tiles:
+            self.filter.setFocus(Qt.OtherFocusReason)
 
     def preview(self, idx):
         if idx != self.selected_idx:
+            self.tiles[self.selected_idx].selected = False
+            self.tiles[self.selected_idx].update()
             self.selected_idx = idx
+            self.tiles[idx].selected = True
+            self.tiles[idx].update()
             self.update()
 
     def refresh(self):
@@ -2321,11 +2813,13 @@ class CharactersPage(Page):
             t.set_state(self.save.fighter_unlocked(t.idx))
         n = self.save.fighters_unlocked()
         self.count_txt = f"{n} / {len(sd.FIGHTERS)}"
+        self.tiles[self.selected_idx].selected = True
+        self.apply_filter()
         self.update()
 
     def toggle(self, i):
         new = not self.save.fighter_unlocked(i)
-        self.app.store.edit(lambda s: s.set_fighter(i, new))
+        self.app.store.edit(lambda s: s.set_fighter(i, new), label=f"{'Unlock' if new else 'Lock'} {sd.FIGHTERS[i][0]}")
         play("unlock" if new else "lock")
         self.tiles[i].set_state(new, animate=True)
         self.app.toast(f"{sd.FIGHTERS[i][0].upper()} {'UNLOCKED' if new else 'LOCKED'}",
@@ -2340,29 +2834,38 @@ class CharactersPage(Page):
         def run(s):
             for i in range(len(sd.FIGHTERS)):
                 s.set_fighter(i, value)
-        self.app.store.edit(run)
+        self.app.store.edit(run, label="Unlock base fighters" if value else "Lock base fighters")
         play("unlock" if value else "lock")
         for t in self.tiles:
             t.unlocked = before[t.idx]
-            r, c = divmod(t.idx, self.COLS)
+            r, c = divmod(t.idx, getattr(self, "columns", self.COLS))
             t.set_state(value, animate=True, delay=(r + c) * 22)
         self.app.toast("ALL FIGHTERS UNLOCKED!" if value else "ALL FIGHTERS LOCKED")
 
     def confirm_lock_all(self):
-        ConfirmOverlay(self.app, "Lock all fighters?",
-                       "Every fighter will be locked again and you'll have to unlock them "
-                       "in-game (or here). This only changes the editor until you press <b>SAVE</b>.",
-                       [("LOCK ALL", G["lock"], "red", lambda: self.set_all(False)),
+        self.confirm_set_all(False)
+
+    def confirm_set_all(self, value):
+        count = sum(self.save.fighter_unlocked(i) != value for i in range(len(sd.FIGHTERS)))
+        if not count:
+            self.app.toast("ALL BASE FIGHTERS ALREADY " + ("UNLOCKED" if value else "LOCKED"))
+            return
+        verb = "Unlock" if value else "Lock"
+        ConfirmOverlay(self.app, f"{verb} {count} base fighters?",
+                       f"Change <b>{count}</b> of the <b>{len(sd.FIGHTERS)} supported base fighters</b>. "
+                       "This affects the complete roster, including hidden search results. DLC is not edited. "
+                       "You can undo this change with <b>Ctrl+Z</b>; nothing is written until <b>SAVE</b>.",
+                       [(f"{verb.upper()} {count}", G["unlock" if value else "lock"], "yellow" if value else "red", lambda: self.set_all(value)),
                         ("CANCEL", G["back"], "dark", None)]).open()
 
     def paintEvent(self, _):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        p.fillRect(QRectF(0, 0, W, self.bar_y), QColor("#08090b"))
+        p.fillRect(QRectF(0, 0, self.width(), self.bar_y), QColor("#08090b"))
         y = self.bar_y + 4
         h = self.height() - y - 7
-        p.setPen(QPen(QColor("#32b9d6"), 3)); p.drawLine(0, self.bar_y, W, self.bar_y)
-        card = QRectF(8, y, W * 0.46, h)
+        p.setPen(QPen(QColor("#32b9d6"), 3)); p.drawLine(0, self.bar_y, self.width(), self.bar_y)
+        card = QRectF(8, y, self.width() * 0.46, h)
         facets(p, card, "#ed1728", 20)
         tile = self.tiles[self.selected_idx]
         p.save(); p.setClipPath(para_path(card, 20))
@@ -2403,14 +2906,14 @@ class CharactersPage(Page):
         badge = QRectF(x, y + h - 36, card.right() - x - 20, 27)
         p.fillRect(badge, QColor("#fafafa")); p.setPen(QPen(QColor("#111111"), 2)); p.drawRect(badge)
         p.setFont(game_font(16)); p.setPen(QColor("#111111")); p.drawText(badge, Qt.AlignCenter, state)
-        summary = QRectF(card.right() + 10, y, W - 285 - card.right() - 10, h)
+        summary = QRectF(card.right() + 10, y, self.unlock_all.x() - card.right() - 18, h)
         facets(p, summary, "#292b30", 12)
         p.setFont(label_font(18)); p.setPen(WHITE)
         p.drawText(summary.adjusted(16, 10, -16, -10), Qt.AlignHCenter | Qt.AlignTop, "BASE FIGHTERS")
         p.setFont(game_font(32)); p.setPen(YELLOW)
         p.drawText(summary, Qt.AlignCenter, self.count_txt)
         p.setFont(label_font(14)); p.setPen(WHITE)
-        p.drawText(summary.adjusted(15, 0, -15, -10), Qt.AlignHCenter | Qt.AlignBottom, "DLC requires installed content")
+        p.drawText(summary.adjusted(15, 0, -15, -10), Qt.AlignHCenter | Qt.AlignBottom, "DLC is not edited")
 
 
 class StatsPage(Page):
@@ -2425,18 +2928,35 @@ class StatsPage(Page):
             b.clicked.connect(lambda _=False, n=name: self.show_cat(n))
             self.cats.append((name, b))
         self.card = DarkCard(self, "")
-        self.card.setGeometry(M + 280, 10, W - 2 * M - 280, PANEL_H - 36)
         self.scroll = QScrollArea(self.card)
-        self.scroll.setGeometry(34, 50, self.card.width() - 70, self.card.height() - 64)
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
         self.scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
         self.head = QLabel(self.card)
-        self.head.setGeometry(34, 8, self.card.width() - 80, 38)
         self.head.setStyleSheet("color: white; font-family: 'Barlow Condensed'; font-size: 28px;"
                                 " font-weight: 900; font-style: italic; background: transparent;")
+        self.search = QLineEdit(self.card)
+        self.search.setPlaceholderText("Find a record…")
+        self.search.setAccessibleName("Search records in the current category")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.filter_rows)
+        self.rows = []
+        self.no_matches = None
         self.cat = None
         self.shown_for = None
+        self.finish_layout()
+
+    def layout_content(self):
+        step = min(60, (self.height() - 14) / len(self.cats))
+        category_width = min(270, round(self.width() * 0.26))
+        for i, (_, button) in enumerate(self.cats):
+            button.setGeometry(M - 4, round(14 + i * step), category_width, round(step - 2))
+        x = M + category_width + 10
+        self.card.setGeometry(x, 10, self.width() - M - x, self.height() - 28)
+        self.scroll.setGeometry(34, 50, self.card.width() - 70, self.card.height() - 64)
+        search_width = min(280, round(self.card.width() * 0.45))
+        self.head.setGeometry(34, 8, self.card.width() - search_width - 80, 38)
+        self.search.setGeometry(self.card.width() - search_width - 32, 10, search_width, 34)
 
     def refresh(self):
         if not self.save:
@@ -2444,8 +2964,7 @@ class StatsPage(Page):
         if self.cat is None or self.save is not self.shown_for:
             self.show_cat(self.cat or "Combined")
             return
-        body = self.scroll.widget()
-        for row in body.findChildren(StatRow) if body else []:
+        for row in self.rows:
             row.sync(self.save.get(row.off, 4))
 
     def show_cat(self, name):
@@ -2456,16 +2975,35 @@ class StatsPage(Page):
         self.head.setText(name.upper())
         body = QWidget()
         lay = QVBoxLayout(body); lay.setContentsMargins(0, 0, 14, 0); lay.setSpacing(4)
+        self.rows = []
         for label, off, value in self.save.stats(name):
-            lay.addWidget(StatRow(self, label, off, value))
+            row = StatRow(self, label, off, value)
+            self.rows.append(row)
+            lay.addWidget(row)
+        self.no_matches = QLabel("No records match this search in the current category.")
+        self.no_matches.setWordWrap(True)
+        self.no_matches.setStyleSheet("color: #33333a; font-size: 15px; padding: 8px;")
+        lay.addWidget(self.no_matches)
         lay.addStretch()
         self.scroll.setWidget(body)
+        self.filter_rows()
         eff = QGraphicsOpacityEffect(body); body.setGraphicsEffect(eff)
         tween(body, "fade", 0, 1, 260, lambda v: eff.setOpacity(v),
               done=lambda: body.setGraphicsEffect(None))
 
+    def filter_rows(self):
+        if self.no_matches is None:
+            return
+        query = search_key(self.search.text())
+        has_match = False
+        for row in self.rows:
+            match = query in search_key(row.label)
+            row.setVisible(match)
+            has_match |= match
+        self.no_matches.setVisible(not has_match)
+
     def write(self, off, value, row):
-        self.app.store.edit(lambda s: s.set_stats({off: value}))
+        self.app.store.edit(lambda s: s.set_stats({off: value}), label=f"Set {row.label}")
         row.flash()
 
 
@@ -2475,12 +3013,15 @@ class StatRow(QWidget):
         self.page, self.off, self.secs = page, off, "(seconds)" in label
         self.setFixedHeight(40)
         self.label = label.replace(" (seconds)", "")
+        self.setToolTip(label)
         self.edit = QLineEdit(str(value), self)
+        self.edit.setAccessibleName(label)
+        self.edit.setToolTip(f"{label} · 0–{sd.STAT_MAX:,}")
         self.edit.setValidator(QIntValidator(0, sd.STAT_MAX, self))
         self.edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.edit.setStyleSheet(
             "QLineEdit { background: #ffffff; color: #111111; border: 2px solid #242424; border-radius: 0px;"
-            " font-family: 'Barlow Condensed'; font-size: 21px; font-weight: 800; padding: 0 8px;"
+            " font-family: 'Nunito'; font-size: 16px; font-weight: 800; padding: 0 8px;"
             " selection-background-color: #e3001b; selection-color: white; }"
             "QLineEdit:focus { border-color: #e3001b; background: #fff8c5; }")
         self.edit.editingFinished.connect(self.commit)
@@ -2494,18 +3035,24 @@ class StatRow(QWidget):
     def eventFilter(self, obj, e):
         if e.type() == e.FocusOut:
             self.edit.deselect()
+            if not self.page.app.store.busy and not self.edit.hasAcceptableInput():
+                self.commit()
         elif e.type() == e.FocusIn:
             self.start_text = self.edit.text()
             QTimer.singleShot(0, self.edit.selectAll)
             self.page.scroll.ensureWidgetVisible(self, 0, 30)
-            if STATUS:
-                STATUS.describe(f"{self.label}: type a number, or press OK / Enter to adjust")
+            self.page.app.status.describe(f"{self.label}: type a number, or press OK / Enter to adjust")
             if e.reason() in (Qt.MouseFocusReason, Qt.TabFocusReason, Qt.BacktabFocusReason):
                 play("move")
-        elif e.type() == e.KeyPress and (e.key() in (Qt.Key_Up, Qt.Key_Down) or (
-                e.key() == Qt.Key_Left and (self.edit.hasSelectedText() or self.edit.cursorPosition() == 0))):
-            self.page.app.move_focus(e.key())
-            return True
+        elif e.type() == e.KeyPress:
+            key = e.key()
+            if key in (Qt.Key_Q, Qt.Key_E) and e.modifiers() == Qt.NoModifier:
+                self.page.app.cycle(-1 if key == Qt.Key_Q else 1)
+                return True
+            if key in (Qt.Key_Up, Qt.Key_Down) or (
+                    key == Qt.Key_Left and (self.edit.hasSelectedText() or self.edit.cursorPosition() == 0)):
+                self.page.app.move_focus(key)
+                return True
         return False
 
     def on_return(self):
@@ -2529,15 +3076,20 @@ class StatRow(QWidget):
             self.value = value
             self.edit.setText(str(value))
             self.start_text = str(value)
+        self.update()
 
     def commit(self):
         t = self.edit.text().strip()
-        if not t:
-            self.edit.setText(str(self.value)); return
-        v = int(t)
+        if t == str(self.value):
+            return
+        v, valid = self.edit.validator().locale().toInt(t)
+        if not valid or not self.edit.hasAcceptableInput():
+            self.edit.setText(str(self.value))
+            self.page.app.toast(f"ENTER A NUMBER FROM 0 TO {sd.STAT_MAX:,}", "error")
+            return
         if v != self.value:
-            self.value = v
             self.page.write(self.off, v, self)
+            self.value = v
             play("select")
 
     def flash(self):
@@ -2549,95 +3101,198 @@ class StatRow(QWidget):
     def paintEvent(self, _):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(0, 2, -176, -2)
-        p.fillRect(r, QColor("#ffe25a") if self.ft > 0.1 else QColor("#d9dade"))
+        modified = self.page.save.data[self.off:self.off + 4] != self.page.save.clean[self.off:self.off + 4]
+        p.fillRect(r, QColor("#ffe25a") if self.ft > 0.1 else QColor("#fff0b5") if modified else QColor("#d9dade"))
+        if modified:
+            p.fillRect(QRectF(r.left(), r.top(), 4, r.height()), RED_MID)
         p.setFont(label_font(19, QFont.DemiBold)); p.setPen(QColor("#161616"))
-        p.drawText(r.adjusted(12, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.label)
+        label_rect = r.adjusted(12, 0, -10, 0)
+        duration = None
         if self.secs and self.edit.text().isdigit():
+            duration = fmt_duration(int(self.edit.text()))
+            label_rect.setRight(label_rect.right() - QFontMetricsF(label_font(15, QFont.DemiBold, True)).horizontalAdvance(duration) - 14)
+        text = QFontMetricsF(p.font()).elidedText(self.label, Qt.ElideRight, max(0, label_rect.width()))
+        p.drawText(label_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+        if duration is not None:
             p.setFont(label_font(15, QFont.DemiBold, True)); p.setPen(QColor("#494949"))
-            p.drawText(r.adjusted(0, 0, -10, 0), Qt.AlignVCenter | Qt.AlignRight, fmt_duration(int(self.edit.text())))
+            p.drawText(r.adjusted(0, 0, -10, 0), Qt.AlignVCenter | Qt.AlignRight, duration)
 
 
 class BackupsPage(Page):
+    """Recoverable snapshots: provenance, explicit load, and consistent errors."""
+
     def __init__(self, app, parent):
         super().__init__(app, parent)
+        self._last_listing_error = None
         self.card = DarkCard(self, "")
-        self.card.setGeometry(M - 4, 10, 640, PANEL_H - 36)
-        head = QLabel("SAVED BACKUPS", self.card)
-        head.setGeometry(34, 8, 400, 38)
-        head.setStyleSheet("color: white; font-family: 'Barlow Condensed'; font-size: 28px;"
-                           " font-weight: 900; font-style: italic; background: transparent;")
+        self.head = QLabel("SAVED BACKUPS", self.card)
+        self.head.setStyleSheet("color: white; font-family: 'Barlow Condensed'; font-size: 28px;"
+                               " font-weight: 900; font-style: italic; background: transparent;")
+        self.filter_source = QCheckBox("This save only", self.card)
+        self.filter_source.setStyleSheet("color: white; font-size: 13px; font-weight: 700;")
+        self.filter_source.setToolTip("Show backups whose recorded source matches this save or its other Ryujinx slot")
+        self.filter_source.toggled.connect(self.refresh)
         self.list = QListWidget(self.card)
-        self.list.setGeometry(34, 52, self.card.width() - 78, self.card.height() - 70)
+        self.list.setAccessibleName("Saved backups, newest first")
+        self.list.installEventFilter(self)
         self.list.setStyleSheet(
             "QListWidget { background: transparent; border: none; outline: none; color: #161616;"
-            " font-family: 'Barlow Condensed'; font-size: 20px; font-weight: 700; }"
+            " font-family: 'Nunito'; font-size: 14px; font-weight: 700; }"
             "QListWidget::item { padding: 8px 10px; margin: 2px 0; background: #dedfe2; border-left: 4px solid #161616; }"
             "QListWidget::item:hover { background: #fff3a3; }"
             "QListWidget::item:selected { background: #ffd400; color: #111; }")
         self.list.itemActivated.connect(lambda _: self.restore())
-        x = M + 650
-        bw = W - M - x + 4
+        self.list.currentItemChanged.connect(self.selection_changed)
         self.restore_btn = PlateButton("LOAD BACKUP", self, G["backups"], "yellow",
-                                       desc="Load the selected backup into the editor (then SAVE to write it)")
-        self.restore_btn.setGeometry(x, 18, bw, 64); self.restore_btn.clicked.connect(self.restore)
-        now = PlateButton("BACKUP NOW", self, G["save"], "dark", desc="Copy the save files on disk to a new backup")
-        now.setGeometry(x + 4, 92, bw - 8, 50); now.clicked.connect(self.backup_now)
-        folder = PlateButton("OPEN FOLDER", self, G["folder"], "dark", desc=sd.BACKUP_DIR)
-        folder.setGeometry(x + 4, 146, bw - 8, 50)
-        folder.clicked.connect(lambda: (os.makedirs(sd.BACKUP_DIR, exist_ok=True),
-                                        QDesktopServices.openUrl(QUrl.fromLocalFile(sd.BACKUP_DIR))))
+                                       desc="Load the selected backup into the editor; Ctrl+Z undoes it. SAVE writes it to disk.")
+        self.restore_btn.clicked.connect(self.restore)
+        self.restore_btn.setEnabled(False)
+        self.now = PlateButton("BACKUP NOW", self, G["save"], "dark",
+                               desc="Back up the original files on disk, including both existing Ryujinx slots")
+        self.now.clicked.connect(self.backup_now)
+        self.folder = PlateButton("OPEN FOLDER", self, G["folder"], "dark", desc=sd.BACKUP_DIR)
+        self.folder.clicked.connect(self.open_folder)
         self.note = QLabel(self)
         self.note.setWordWrap(True)
-        self.note.setGeometry(x + 4, 210, bw - 8, 150)
-        self.note.setStyleSheet("color: #303035; font-family: 'Barlow Condensed'; font-size: 17px;"
-                                " font-weight: 600; font-style: italic; background: transparent;")
-        self.note.setText(f"A backup of both Ryujinx slots is made every time you press SAVE. "
-                          f"The newest {sd.BACKUP_KEEP} are kept.")
+        self.note.setStyleSheet("color: #303035; font-family: 'Nunito'; font-size: 14px;"
+                               " font-weight: 600; background: transparent;")
+        self.note.setText(f"SAVE backs up disk files; the newest {sd.BACKUP_KEEP} are kept. "
+                          "BACKUP NOW excludes unsaved edits. LOAD affects only the editor. "
+                          "Ctrl+Z undoes it; SAVE writes it.")
+        self.finish_layout()
+
+    def layout_content(self):
+        actions_width = min(346, round(self.width() * 0.34))
+        compact = self.height() < 320
+        x = self.width() - M - actions_width + 4
+        self.card.setGeometry(M - 4, 10, x - M - 10, self.height() - 28)
+        self.head.setGeometry(34, 8, self.card.width() - 204, 38)
+        self.filter_source.setGeometry(self.card.width() - 158, 8, 120, 38)
+        self.list.setGeometry(34, 52, self.card.width() - 78, self.card.height() - 70)
+        self.restore_btn.setGeometry(x, 18, actions_width, 50 if compact else 64)
+        y = self.restore_btn.geometry().bottom() + 7
+        for button in (self.now, self.folder):
+            button.setGeometry(x + 4, y, actions_width - 8, 39 if compact else 50)
+            y = button.geometry().bottom() + 5
+        self.note.setGeometry(x + 4, y + 6, actions_width - 8, self.height() - y - 12)
+
+    def selection_changed(self, current=None, previous=None):
+        current = self.list.currentItem()
+        self.restore_btn.setEnabled(bool(current and current.data(Qt.UserRole)))
+
+    def eventFilter(self, obj, event):
+        if obj is self.list and event.type() == event.KeyPress:
+            key = event.key()
+            if key == Qt.Key_Right:
+                target = self.restore_btn if self.restore_btn.isEnabled() else self.now
+                target.setFocus(Qt.TabFocusReason)
+                return True
+            if key == Qt.Key_Up and self.list.currentRow() <= 0:
+                self.filter_source.setFocus(Qt.TabFocusReason)
+                return True
+        return super().eventFilter(obj, event)
 
     def refresh(self):
-        sel = self.list.currentRow()
+        selected = self.list.currentItem()
+        selected_path = selected.data(Qt.UserRole) if selected else None
         self.list.clear()
-        for d, f, mt in sd.list_backups():
-            slots = len([x for x in os.listdir(d) if x.endswith("system_data.bin")])
-            it = QListWidgetItem(f"{time.strftime('%d %b %Y  ·  %H:%M:%S', time.localtime(mt))}"
-                                 f"      {'both slots' if slots > 1 else '1 file'}")
-            it.setData(Qt.UserRole, f)
-            self.list.addItem(it)
+        error = None
+        source_only = self.filter_source.isChecked() and self.save is not None
+        current_path = self.save.path if self.save else None
+        same_save = (current_path, sd.mirror_path(current_path)) if source_only else ()
+        try:
+            for folder, path, mtime in sd.list_backups():
+                try:
+                    details = sd.backup_details(folder)
+                    names = sorted(name for name in os.listdir(folder) if name.endswith("system_data.bin"))
+                except FileNotFoundError:
+                    continue
+                entries = [entry for entry in details.get("files", []) if isinstance(entry, dict)]
+                count = len(names)
+                date = time.strftime('%d %b %Y  ·  %H:%M:%S', time.localtime(mtime))
+                origin = next((entry.get("source") for entry in entries
+                               if entry.get("file") == os.path.basename(path) and isinstance(entry.get("source"), str)), None)
+                if source_only and (not origin or origin not in same_save):
+                    continue
+                source = os.sep.join(origin.split(os.sep)[-3:]) if origin else "Origin not recorded (legacy backup)"
+                label = f"{date}  ·  {count} {'files' if count != 1 else 'file'}\n{os.path.basename(path)}  ·  {source}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, path)
+                item.setData(Qt.UserRole + 1, origin)
+                item.setToolTip(f"Backup: {path}\nSource: {origin or 'Not recorded'}\nFiles: {', '.join(names)}")
+                self.list.addItem(item)
+                if path == selected_path:
+                    self.list.setCurrentItem(item)
+        except (OSError, ValueError, OverflowError) as exc:
+            error = str(exc)
         if self.list.count() == 0:
-            it = QListWidgetItem("No backups yet — one is made on every save.")
-            it.setFlags(Qt.NoItemFlags); self.list.addItem(it)
-        else:
-            self.list.setCurrentRow(max(0, min(sel, self.list.count() - 1)))
+            if error:
+                text = "Backups could not be read. Check the folder permissions."
+            elif source_only:
+                text = "No backups have a recorded source matching this save."
+            else:
+                text = "No backups yet — create one or save your changes."
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.NoItemFlags)
+            self.list.addItem(item)
+        elif self.list.currentRow() < 0:
+            self.list.setCurrentRow(0)
+        self.selection_changed()
+        if error and error != self._last_listing_error:
+            self.app.toast(f"COULDN'T LIST BACKUPS: {error}", "error", ms=5000)
+        self._last_listing_error = error
         super().refresh()
 
-    def restore(self):
-        it = self.list.currentItem()
-        path = it.data(Qt.UserRole) if it else None
-        if not path:
-            self.app.toast("SELECT A BACKUP FIRST", "error"); return
+    def show_error(self, title, error):
+        ConfirmOverlay(self.app, title, html.escape(str(error)),
+                       [("OK", G["check"], "yellow", None)]).open()
 
+    def restore(self):
+        item = self.list.currentItem()
+        path = item.data(Qt.UserRole) if item else None
+        if not path:
+            self.app.toast("SELECT A BACKUP FIRST", "error")
+            return
+        label = item.text().split('\n')[0]
         play("select")
 
         def go():
-            try:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                self.app.store.edit(lambda s: s.load_bytes(raw))
-            except (OSError, sd.InvalidSave) as e:
-                self.app.toast(f"COULDN'T LOAD: {e}", "error"); return
-            self.app.toast("BACKUP LOADED — PRESS SAVE TO KEEP IT")
+            def finished(raw, error):
+                if error is not None:
+                    self.show_error("Backup could not be loaded", error)
+                    return
+                self.app.store.edit(lambda save: save.load_bytes(raw), label="Restore backup")
+                self.app.toast("BACKUP LOADED — CTRL+Z TO UNDO · SAVE TO WRITE")
+
+            self.app.run_disk_job("Reading backup", lambda: sd.read_backup(path), finished)
+
+        warning = "This replaces your unsaved edits in the editor. " if self.app.store.dirty else ""
+        source = item.data(Qt.UserRole + 1)
+        current = self.save.path
+        if source and source not in (current, sd.mirror_path(current)):
+            warning += "This backup comes from a different save path. "
         ConfirmOverlay(self.app, "Load this backup?",
-                       f"<b>{it.text().split('      ')[0]}</b><br>The editor will show the backup's data. "
-                       "Nothing is written to disk until you press <b>SAVE</b>.",
+                       f"<b>{html.escape(label)}</b><br>{warning}"
+                       "Nothing is written to disk until you press <b>SAVE</b>. "
+                       "Press <b>Ctrl+Z</b> to undo the load.",
                        [("LOAD", G["backups"], "yellow", go), ("CANCEL", G["back"], "dark", None)],
                        glyph=G["backups"]).open()
 
     def backup_now(self):
-        s = self.save
-        targets = [s.path] + ([sd.mirror_path(s.path)] if sd.mirror_path(s.path) else [])
-        dest = sd.make_backup(targets)
-        self.refresh()
-        self.app.toast(f"BACKUP CREATED: {os.path.basename(dest)}" if dest else "NOTHING TO BACK UP")
+        if not self.save:
+            self.app.toast("OPEN A SAVE FIRST", "error")
+            return
+        other = sd.mirror_path(self.save.path)
+        targets = [self.save.path] + ([other] if other else [])
+        self.app.create_backup(targets, self)
+
+    def open_folder(self):
+        try:
+            os.makedirs(sd.BACKUP_DIR, exist_ok=True)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(sd.BACKUP_DIR)):
+                raise OSError("The desktop could not open the backup folder. Open it manually: " + sd.BACKUP_DIR)
+        except OSError as exc:
+            self.show_error("Folder could not be opened", exc)
 
 
 # ========================================================= main window =====
@@ -2655,20 +3310,40 @@ class MainWindow(QWidget):
         super().__init__(None)
         self.setWindowTitle("Ultimate Smasher")
         self.setWindowIcon(QIcon(os.path.join(IMG, "icon.ico")))
-        self.setFixedSize(W, H)
+        self.setMinimumSize(W, H)
+        self.resize(W, H)
+        self._was_maximized = False
+        self._windowed_geometry = self.geometry()
+        self.fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        self.fullscreen_shortcut.setAutoRepeat(False)
+        self.fullscreen_shortcut.activated.connect(self.toggle_fullscreen)
+        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.undo_shortcut.activated.connect(self.undo)
+        self.redo_shortcut.activated.connect(self.redo)
+        self.section_shortcuts = []
+        for key, step in (("Ctrl+PageUp", -1), ("Ctrl+PageDown", 1)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda step=step: self.cycle(step))
+            self.section_shortcuts.append(shortcut)
+        for key, action in (("Alt+F", self.show_files), ("Ctrl+Shift+S", self.export_copy), ("Ctrl+I", self.review_changes)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setAutoRepeat(False)
+            shortcut.activated.connect(action)
         self.setFocusPolicy(Qt.StrongFocus)
         self.store = Store()
+        self.preferences = QSettings("UltimateSmasher", "UltimateSmasher")
+        self._disk_job = None
         self.force_close = False
         self.current = None
         self.streaks = make_streaks(7)
         self.phase = 0.0
         self.header_title, self.header_k = APP_TITLE, 1.0
 
-        global STATUS, CURSOR, PAD
         # header buttons
         x = M
-        self.open_btn = PlateButton("OPEN SAVE", self, G["open"], "dark", desc="Open a system_data.bin (Ctrl+O)")
-        self.open_btn.setGeometry(x, 10, 150, 36); self.open_btn.clicked.connect(self.open_dialog)
+        self.open_btn = PlateButton("FILES", self, G["open"], "dark", desc="Open, review or export saves")
+        self.open_btn.setGeometry(x, 10, 150, 36); self.open_btn.clicked.connect(self.show_files)
         self.save_btn = PlateButton("SAVE", self, G["save"], "dark", desc="Save changes and back up the old file (Ctrl+S)")
         self.save_btn.setGeometry(x + 156, 10, 104, 36); self.save_btn.clicked.connect(self.save_file)
         self.help_btn = PlateButton("HELP", self, G["help"], "dark", desc="How to use")
@@ -2681,7 +3356,19 @@ class MainWindow(QWidget):
         mb.clicked.connect(self.showMinimized); mb.setFocusPolicy(Qt.NoFocus)
         xb = PlateButton("", self, G["close"], "dark", desc="Close"); xb.setGeometry(W - M - 42, 10, 42, 36)
         xb.clicked.connect(self.close); xb.setFocusPolicy(Qt.NoFocus)
-        self.header_buttons = [self.open_btn, self.save_btn, self.help_btn, mb, xb]
+        self.fullscreen_btn = PlateButton("", self, G["fullscreen"], "dark", desc="Toggle fullscreen (F11)")
+        self.fullscreen_btn.setFocusPolicy(Qt.NoFocus)
+        self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
+        self.window_buttons = [self.fullscreen_btn, mb, xb]
+        self.header_buttons = [self.open_btn, self.save_btn, self.help_btn] + self.window_buttons
+        self.undo_btn = PlateButton("", self, "\uf0e2", "dark", desc="Undo (Ctrl+Z)")
+        self.redo_btn = PlateButton("", self, "\uf01e", "dark", desc="Redo (Ctrl+Shift+Z)")
+        for i, button in enumerate((self.undo_btn, self.redo_btn)):
+            button.setGeometry(514 + i * 44, 10, 42, 36)
+            button.setFocusPolicy(Qt.NoFocus)
+        self.undo_btn.clicked.connect(self.undo)
+        self.redo_btn.clicked.connect(self.redo)
+        self.header_buttons += [self.undo_btn, self.redo_btn]
 
         # section view: tabs + panel with pages
         self.panel = Panel(self)
@@ -2707,51 +3394,135 @@ class MainWindow(QWidget):
         self.empty.setGeometry(0, 8, W, PANEL_H - 8)
         self.section_widgets = self.tabs + [self.panel, self.key_q, self.key_e]
 
-        self.hub = Hub(self, self.open_section, self.hub_info, self.ask_quit)
+        self.hub = Hub(self, self.open_section, self.ask_quit)
         self.hub.setGeometry(0, 0, W, H)
 
-        STATUS = StatusBar(self.store, self)
-        STATUS.setGeometry(0, H - SB_H, W, SB_H)
-        CURSOR = Cursor(self)
+        self.status = StatusBar(self.store, self)
+        self.status.setGeometry(0, H - SB_H, W, SB_H)
+        self.selection_cursor = Cursor(self)
+        for scroll in self.findChildren(QScrollArea):
+            scroll.verticalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
+            scroll.horizontalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
         self.toast_w = Toast(self)
         self.store.changed.connect(self.on_change)
         QApplication.instance().focusChanged.connect(self.focus_changed)
-        PAD = gamepad.Gamepad(self)
-        PAD.connected_changed.connect(self.pad_changed)
+        self.pad = gamepad.Gamepad(self)
+        self.pad.connected_changed.connect(self.pad_changed)
+        self.pad.section_step.connect(self.cycle)
+        settings.changed.connect(self.motion_changed)
         self.motion = QTimer(self); self.motion.timeout.connect(self.tick); self.motion.start(40)
 
-        if path or sd.default_save_path():
-            try:
-                self.store.load(path or sd.default_save_path())
-            except sd.InvalidSave as e:
-                msg = str(e)
-                QTimer.singleShot(600, lambda: self.toast(msg, "error", 5000))
         self.on_change()
         self.show_hub(intro=True)
+        if path:
+            self.load_path(path, startup=True)
+        else:
+            self.run_disk_job("Finding save", sd.default_save_path, self.finish_autodetect)
+
+    def finish_autodetect(self, path, error):
+        if path and error is None:
+            self.load_path(path, startup=True)
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self.setMinimumSize(W, H)
+            self.setGeometry(self._windowed_geometry)
+            if self._was_maximized:
+                self.showMaximized()
+        else:
+            self._was_maximized = self.isMaximized()
+            self._windowed_geometry = self.normalGeometry() if self._was_maximized else self.geometry()
+            # Fullscreen must fit the screen even when its logical size is small.
+            self.setMinimumSize(0, 0)
+            self.showFullScreen()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "toast_w"):
+            return
+        w, h = self.width(), self.height()
+        panel_h = h - PANEL_Y - SB_H
+        self.panel.setGeometry(0, PANEL_Y, w, panel_h)
+        for page in self.pages:
+            animation = page.__dict__.get("_slide")
+            if animation is not None:
+                animation.stop()
+            page.setGeometry(0, 8, w, panel_h - 8)
+        self.empty.setGeometry(0, 8, w, panel_h - 8)
+        weights = [1.1, 0.95, 1.25, 0.95, 1.05]
+        span = w - 2 * M - 70 + 6 * (len(self.tabs) - 1)
+        x = float(M + 35)
+        for i, (tab, weight) in enumerate(zip(self.tabs, weights)):
+            animation = tab.__dict__.get("_drop")
+            if animation is not None:
+                animation.stop()
+            width = span * weight / sum(weights)
+            self.tab_x[i] = round(x)
+            tab.setGeometry(round(x), TAB_Y, round(width), TAB_H)
+            x += width - 6
+        self.key_e.move(w - M - 26, TAB_Y + 18)
+        for i, button in enumerate(self.window_buttons):
+            button.setGeometry(w - M - (len(self.window_buttons) - i) * 46 + 4, 10, 42, 36)
+        compact = w < 920
+        x = M
+        for button, width in zip(
+            (self.open_btn, self.save_btn, self.help_btn, self.back_btn, self.undo_btn, self.redo_btn),
+            (114, 82, 82, 86, 42, 42) if compact else (150, 104, 100, 110, 42, 42),
+        ):
+            button.setGeometry(x, 10, width, 36)
+            x += width + 6
+        self.hub.setGeometry(self.rect())
+        self.status.setGeometry(0, h - SB_H, w, SB_H)
+        self.selection_cursor.setGeometry(self.rect())
+        self.selection_cursor.refresh()
+        self.toast_w.move(w - self.toast_w.width() + 10, 3)
+        for overlay in self.findChildren(Overlay, options=Qt.FindDirectChildrenOnly):
+            overlay.setGeometry(self.rect())
 
     # ------------------------------------------------------------- state --
     def focus_changed(self, old, new):
-        if CURSOR is not None:
-            CURSOR.track(new)
-        if STATUS is not None:
-            STATUS.update()
+        if any(widget is not None and widget.window() is self for widget in (old, new)):
+            self.selection_cursor.track(new)
+            self.status.update()
 
     def pad_changed(self, on):
         self.toast("CONTROLLER CONNECTED" if on else "CONTROLLER DISCONNECTED", "ok" if on else "error")
-        STATUS.update()
+        self.status.update()
+
+    def motion_changed(self, reduced):
+        if reduced:
+            for page in self.pages:
+                animation = page.__dict__.get("_slide")
+                if animation is not None:
+                    animation.stop()
+                    page.move(0, 8)
+            for tab, x in zip(self.tabs, self.tab_x):
+                animation = tab.__dict__.get("_drop")
+                if animation is not None:
+                    animation.stop()
+                    tab.move(x, TAB_Y)
+            self.hub.pulse = 0.0
+            self.hub.update()
+        else:
+            tween(self.selection_cursor, "pulse", 0, 1, 1100, self.selection_cursor._pulse, QEasingCurve.Linear, loops=-1)
+            if self.store.dirty:
+                tween(self.status, "pulse", 0, 1, 1400, self.status._set_pulse, QEasingCurve.Linear, loops=-1)
 
     def tick(self):
         if not self.isVisible() or self.isMinimized() or not self.isActiveWindow():
             return
-        self.phase += 0.04
+        if not settings.reduced_motion:
+            self.phase += 0.04
         if self.current is None:
             clock_text = time.strftime("%H:%M")
             if clock_text != self.hub.clock_text:
                 self.hub.clock_text = clock_text
                 self.hub.update()
         else:
-            self.panel.phase = self.phase
-            self.panel.update()
+            if not settings.reduced_motion:
+                self.panel.phase = self.phase
+                self.panel.update()
 
     def set_header(self, text):
         if text == self.header_title:
@@ -2761,7 +3532,7 @@ class MainWindow(QWidget):
 
     def _header(self, v):
         self.header_k = v
-        self.update(QRect(int(W * 0.6) - 30, 0, W, HB + 6))
+        self.update(QRect(int(self.width() * 0.6) - 30, 0, self.width(), HB + 6))
 
     def overlay_open(self):
         return any(isinstance(c, Overlay) and not c.closing for c in self.children())
@@ -2777,12 +3548,21 @@ class MainWindow(QWidget):
 
     def on_change(self):
         dirty = self.store.dirty
+        name = os.path.basename(self.store.save.path) if self.store.loaded else "No save loaded"
+        state = f"{self.store.operation}… " if self.store.busy else "● " if dirty else ""
+        self.setWindowTitle(f"{state}{name} — Ultimate Smasher")
+        self.undo_btn.setEnabled(self.store.can_undo)
+        self.redo_btn.setEnabled(self.store.can_redo)
+        self.undo_btn.setToolTip(f"Undo {self.store.undo_label} (Ctrl+Z)")
+        self.redo_btn.setToolTip(f"Redo {self.store.redo_label} (Ctrl+Shift+Z)")
         self.save_btn.style = "yellow" if dirty else "dark"
+        self.save_btn.setEnabled(self.store.loaded and dirty and not self.store.busy)
         self.save_btn.update()
         if self.current is not None and self.store.loaded:
             self.pages[self.current].refresh()
-        self.hub.tile_info = {name: self.hub_info(name) for name in SECTION_DESC}
-        self.hub.update()
+        if self.current is None:
+            self.hub.tile_info = {name: self.hub_info(name) for name in SECTION_DESC}
+            self.hub.update()
 
     def hub_info(self, name):
         s = self.store.save
@@ -2797,16 +3577,22 @@ class MainWindow(QWidget):
         if name == "STATS":
             return f"{len(sd.STATS)} categories"
         if name == "BACKUPS":
-            n = len(sd.list_backups())
+            try:
+                n = len(sd.list_backups())
+            except OSError:
+                return "Backup folder unavailable"
             return f"{n} backup{'s' if n != 1 else ''}"
         return ""
 
     # -------------------------------------------------------- navigation --
     def show_hub(self, intro=False):
+        self.commit_pending_edit()
+        if self.current is not None:
+            self.pages[self.current]._last_focus = QApplication.focusWidget()
         self.current = None
         self.hub.tile_info = {name: self.hub_info(name) for name in SECTION_DESC}
         self.set_header(APP_TITLE)
-        STATUS.default = "Choose a section"
+        self.status.default = "Choose a section"
         for wdg in self.section_widgets:
             wdg.hide()
         self.back_btn.hide()
@@ -2814,44 +3600,51 @@ class MainWindow(QWidget):
             button.hide()
         self.update()
         self.hub.show(); self.hub.raise_()
-        self.hub.play_intro(1000 if intro else 520)
+        self.hub.play_intro(600 if intro else 280)
         self.hub.setFocus()
-        STATUS.hide(); self.toast_w.raise_()
-        STATUS.update()
+        self.status.hide(); self.toast_w.raise_()
+        self.status.update()
 
     def open_section(self, name):
         if not self.store.loaded:
             self.open_dialog(then=lambda: self.open_section(name))
             return
         self.hub.hide()
-        STATUS.show()
+        self.status.show()
         for button in self.header_buttons:
             button.show()
         self.update()
         self.back_btn.show()
         self.panel.show()
-        for i, t in enumerate(self.tabs):  # tabs drop in, staggered
-            start = QPoint(self.tab_x[i] + 90 + 30 * i, TAB_Y)
+        for i, t in enumerate(self.tabs):  # short entry slide, with no overshoot
+            previous = t.__dict__.get("_drop")
+            if previous is not None:
+                previous.stop(); previous.deleteLater()
+            start = QPoint(self.tab_x[i] + 24 + 8 * i, TAB_Y)
             t.show(); t.move(start)
             a = QPropertyAnimation(t, b"pos", t)
-            a.setDuration(420); a.setStartValue(start); a.setEndValue(QPoint(self.tab_x[i], TAB_Y))
-            a.setEasingCurve(QEasingCurve.OutBack)
-            QTimer.singleShot(i * 45, a.start)
+            a.setDuration(0 if settings.reduced_motion else tokens.motion.transition); a.setStartValue(start); a.setEndValue(QPoint(self.tab_x[i], TAB_Y))
+            a.setEasingCurve(QEasingCurve.OutCubic)
+            a.start()
             t.__dict__["_drop"] = a
         self.key_q.show(); self.key_e.show()
         self.select(name, direction=0)
-        STATUS.raise_(); self.toast_w.raise_()
+        self.status.raise_(); self.toast_w.raise_()
 
     def select(self, name, direction=None):
         idx = [s[0] for s in SECTIONS].index(name)
         if direction is None:
             direction = 1 if self.current is None or idx >= self.current else -1
         prev = self.current
+        if prev is not None:
+            self.pages[prev]._last_focus = QApplication.focusWidget()
+        self.commit_pending_edit()
         self.current = idx
         if prev is not None and prev != idx:
             play("tab")
         self.set_header(name)
-        STATUS.default = SECTION_DESC[name]
+        self.status.default = SECTION_DESC[name]
+        self.status.describe(None)
         for i, t in enumerate(self.tabs):
             t.setChecked(i == idx)
         self.empty.setVisible(not self.store.loaded)
@@ -2866,59 +3659,151 @@ class MainWindow(QWidget):
                 pg.hide()
         page.show(); page.raise_()
         if prev != idx:
-            start = QPoint(70 * (direction or 1), 8) if direction else QPoint(0, 40)
+            previous = page.__dict__.get("_slide")
+            if previous is not None:
+                previous.stop(); previous.deleteLater()
+            start = QPoint(28 * (direction or 1), 8) if direction else QPoint(0, 22)
             a = QPropertyAnimation(page, b"pos", page)
-            a.setDuration(340); a.setStartValue(start); a.setEndValue(QPoint(0, 8))
+            a.setDuration(0 if settings.reduced_motion else tokens.motion.transition); a.setStartValue(start); a.setEndValue(QPoint(0, 8))
             a.setEasingCurve(QEasingCurve.OutCubic)
             page.__dict__["_slide"] = a
             eff = QGraphicsOpacityEffect(page); page.setGraphicsEffect(eff)
-            tween(page, "fade", 0, 1, 300, lambda v: eff.setOpacity(v), done=lambda: page.setGraphicsEffect(None))
+            tween(page, "fade", 0, 1, 180, lambda v: eff.setOpacity(v), done=lambda: page.setGraphicsEffect(None))
             a.start()
         focusable = self.focusables(page)
-        (focusable[0] if focusable else self).setFocus()
+        last = getattr(page, "_last_focus", None)
+        if last is not None and not sip.isdeleted(last) and last in focusable and last.isEnabled():
+            last.setFocus()
+        else:
+            (focusable[0] if focusable else self).setFocus()
 
     def cycle(self, d):
-        if self.current is None:
+        if self.current is None or self.store.busy or self.overlay_open():
             return
         n = (self.current + d) % len(SECTIONS)
         self.select(SECTIONS[n][0], direction=d)
 
     # --------------------------------------------------------------- file --
+    def undo(self):
+        self.history_action(False)
+
+    def redo(self):
+        self.history_action(True)
+
+    def history_action(self, redo):
+        if self.store.busy or self.overlay_open():
+            return
+        self.commit_pending_edit()
+        label = self.store.redo() if redo else self.store.undo()
+        if label:
+            self.toast(f"{'REDONE' if redo else 'UNDONE'}: {label}")
+
+    def commit_pending_edit(self):
+        widget = QApplication.focusWidget()
+        row = widget.parent() if isinstance(widget, QLineEdit) else None
+        if isinstance(row, StatRow) and row.page.app is self:
+            row.commit()
+
+    def recent_files(self):
+        paths = self.preferences.value("recent_saves", [], type=list)
+        return [path for path in paths if isinstance(path, str) and os.path.isabs(path)][:8]
+
+    def show_files(self):
+        if not self.store.busy and not self.overlay_open():
+            self.commit_pending_edit()
+            FilesOverlay(self).open()
+
+    def review_changes(self):
+        if self.store.busy or self.overlay_open():
+            return
+        self.commit_pending_edit()
+        if self.store.loaded:
+            ChangesOverlay(self).open()
+        else:
+            self.toast("OPEN A SAVE FIRST", "error")
+
     def open_dialog(self, then=None):
+        after = then if callable(then) else None
+        self.confirm_open(lambda: self._open(after))
+
+    def confirm_open(self, choose):
+        if self.store.busy or self.overlay_open():
+            return
+        self.commit_pending_edit()
         if self.store.dirty:
             ConfirmOverlay(self, "Discard changes?", "You have unsaved changes. Open another file anyway?",
-                           [("SAVE FIRST", G["save"], "yellow", lambda: self.save_file(after=lambda: self._open(then))),
-                            ("DISCARD", G["close"], "red", lambda: self._open(then)),
+                           [("SAVE FIRST", G["save"], "yellow", lambda: self.save_file(after=choose)),
+                            ("DISCARD", G["close"], "red", choose),
                             ("CANCEL", G["back"], "dark", None)]).open()
         else:
-            self._open(then)
+            choose()
 
     def _open(self, then=None):
-        start = self.store.save.path if self.store.save else (sd.default_save_path() or os.path.expanduser("~"))
+        recent = self.recent_files()
+        start = self.store.save.path if self.store.loaded else (recent[0] if recent else os.path.expanduser("~"))
         path, _ = QFileDialog.getOpenFileName(self, "Open system_data.bin", start, "Smash save (system_data.bin *.bin);;All files (*)")
+        if path:
+            self.load_path(path, after=then, remember=True)
+
+    def load_path(self, path, *, after=None, remember=False, startup=False):
+        def finished(candidate, error):
+            if error is not None:
+                if startup:
+                    self.toast(str(error), "error", 6000)
+                else:
+                    self.file_error("Could not open save", error)
+                return
+            self.store.install(candidate)
+            if remember:
+                recent = [item for item in self.recent_files() if item != candidate.path]
+                self.preferences.setValue("recent_saves", [candidate.path, *recent[:7]])
+            if not startup:
+                self.toast("SAVE FILE LOADED")
+            if self.current is not None:
+                self.select(SECTIONS[self.current][0], direction=0)
+            if after:
+                after()
+
+        self.run_disk_job("Opening save", lambda: sd.SaveFile(path), finished)
+
+    def export_copy(self):
+        if self.store.busy or self.overlay_open():
+            return
+        self.commit_pending_edit()
+        if not self.store.loaded:
+            self.toast("OPEN A SAVE FIRST", "error")
+            return
+        save = self.store.save
+        base, ext = os.path.splitext(save.path)
+        path, _ = QFileDialog.getSaveFileName(self, "Export an edited copy", base + "_edited" + (ext or ".bin"),
+                                              "Smash save (*.bin);;All files (*)",
+                                              options=QFileDialog.DontConfirmOverwrite)
         if not path:
             return
-        try:
-            self.store.load(path)
-        except sd.InvalidSave as e:
-            ConfirmOverlay(self, "Not a valid save", str(e), [("OK", G["check"], "yellow", None)]).open()
-            return
-        self.toast("SAVE FILE LOADED")
-        if self.current is not None:
-            self.select(SECTIONS[self.current][0], direction=0)
-        if then:
-            then()
+
+        def finished(_, error):
+            if isinstance(error, sd.CopyPublishedError):
+                self.file_error("Copy created with a warning", error)
+            elif error is not None:
+                self.file_error("Could not export copy", error)
+            else:
+                self.toast(f"COPY EXPORTED: {os.path.basename(path)}")
+
+        self.run_disk_job("Exporting copy", lambda: save.export_copy(path), finished)
+
+    def file_error(self, title, error):
+        ConfirmOverlay(self, title, html.escape(str(error)),
+                       [("OK", G["check"], "yellow", None)]).open()
 
     def save_file(self, after=None):
-        row = QApplication.focusWidget()
-        row = row.parent() if isinstance(row, QLineEdit) else None
-        if isinstance(row, StatRow):
-            row.commit()  # a number still being typed counts as an edit
+        if self.store.busy or self.overlay_open():
+            return
+        self.commit_pending_edit()
         if not self.store.loaded:
             self.toast("OPEN A SAVE FIRST", "error"); return
         if not self.store.dirty:
             self.toast("NO CHANGES TO SAVE")
-            if after:
+            if callable(after):
                 after()
             return
         if sd.ryujinx_running():
@@ -2931,17 +3816,75 @@ class MainWindow(QWidget):
             self._write(after)
 
     def _write(self, after=None):
-        try:
-            dest = self.store.write()
-        except OSError as e:
-            ConfirmOverlay(self, "Save failed", f"{e}", [("OK", G["check"], "yellow", None)]).open()
+        self.run_disk_job("Saving", self.store.save.save,
+                          lambda dest, error: self.finish_save(dest, error, after))
+
+    def run_disk_job(self, operation, work, completed):
+        """Run one file operation while keeping the event loop responsive."""
+        if self.store.busy:
+            return
+        self.commit_pending_edit()
+        focus = self.focusWidget()
+        self.store.set_busy(True, operation)
+        self.setEnabled(False)
+        job = DiskJob(work)
+        self._disk_job = job
+
+        def show_progress():
+            if self._disk_job is job:
+                self.toast(f"{operation.upper()}…", ms=60000)
+
+        def finished(result, error):
+            self._disk_job = None
+            self.setEnabled(True)
+            self.toast_w.hide()
+            self.store.set_busy(False)
+            if focus is not None and not sip.isdeleted(focus) and focus.isVisible() and focus.isEnabled():
+                focus.setFocus()
+            completed(result, error)
+
+        job.signals.finished.connect(finished, Qt.QueuedConnection)
+        QTimer.singleShot(180, show_progress)
+        QThreadPool.globalInstance().start(job)
+
+    def create_backup(self, targets, page):
+        def backup():
+            dest = sd.make_backup(targets, prune=False)
+            warning = None
+            if dest:
+                try:
+                    sd.prune_backups()
+                except OSError:
+                    warning = "BACKUP CREATED. COULDN'T REMOVE OLD BACKUPS."
+            return dest, warning
+
+        def finished(result, error):
+            if error is not None:
+                page.show_error("Backup failed", error)
+            else:
+                dest, warning = result
+                if warning:
+                    self.toast(warning, "error", 7000)
+                else:
+                    self.toast(f"BACKUP CREATED: {os.path.basename(dest)}" if dest else "NOTHING TO BACK UP")
+        self.run_disk_job("Creating backup", backup, finished)
+
+    def finish_save(self, dest, error, after=None):
+        if isinstance(error, sd.SaveConflict):
+            ConfirmOverlay(self, "Save changed on disk",
+                           f"{html.escape(str(error))}<br><br>Export a copy to keep your edits in a new file.",
+                           [("EXPORT COPY", G["save"], "yellow", self.export_copy),
+                            ("BACK", G["back"], "dark", None)]).open()
+            return
+        if error is not None:
+            self.file_error("Save failed", error)
             return
         mirrored = sd.mirror_path(self.store.save.path)
         play("save")
         self.toast("SAVED!" + ("  BOTH SLOTS UPDATED" if mirrored else "") + ("  ·  BACKUP MADE" if dest else ""))
-        if self.current is not None and SECTIONS[self.current][0] == "BACKUPS":
-            self.pages[self.current].refresh()
-        if after:
+        if self.store.save.backup_warning:
+            self.toast(self.store.save.backup_warning, "error", 7000)
+        if callable(after):
             after()
 
     # ------------------------------------------------------------ events --
@@ -2953,6 +3896,8 @@ class MainWindow(QWidget):
             self.open_dialog()
         elif mod & Qt.ControlModifier and k == Qt.Key_Q:
             self.close()
+        elif k == Qt.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen()
         elif k == Qt.Key_Escape and self.current is not None:
             play("back")
             self.show_hub()
@@ -2976,7 +3921,7 @@ class MainWindow(QWidget):
     @staticmethod
     def focusables(page):
         return [w for w in page.findChildren(QWidget)
-                if isinstance(w, (AnimButton, QLineEdit, QListWidget)) and w.isVisibleTo(page)
+                if isinstance(w, (AnimButton, QLineEdit, QListWidget, QComboBox, QCheckBox)) and w.isVisibleTo(page) and w.isEnabled()
                 and w.focusPolicy() & Qt.TabFocus]
 
     def move_focus(self, k):
@@ -2989,7 +3934,18 @@ class MainWindow(QWidget):
         if e.button() == Qt.LeftButton and e.pos().y() < HB and self.windowHandle():
             self.windowHandle().startSystemMove()
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton and e.pos().y() < HB and not self.isFullScreen():
+            self.showNormal() if self.isMaximized() else self.showMaximized()
+        else:
+            super().mouseDoubleClickEvent(e)
+
     def closeEvent(self, e):
+        if self.store.busy or self.overlay_open():
+            e.ignore()
+            return
+        if not self.force_close:
+            self.commit_pending_edit()
         if self.store.dirty and not self.force_close:
             e.ignore()
 
@@ -3027,9 +3983,12 @@ class MainWindow(QWidget):
         p.drawLine(QPointF(w * 0.62 - 26, HB - 4), QPointF(w, HB - 8))
         p.setPen(Qt.NoPen); p.setBrush(QColor(255, 60, 70, 150))
         p.drawPath(smash_ball_path(QPointF(w * 0.555, HB * 0.55), 48))
-        tr = QRectF(w * 0.62, 0, w * 0.38 - 132, HB - 6)
+        title_left = max(w * 0.62, self.redo_btn.geometry().right() + 12)
+        title_right = self.fullscreen_btn.x() - 12
+        tr = QRectF(title_left, 0, max(0, title_right - title_left), HB - 6)
         k = self.header_k
         p.save(); p.setOpacity(k)
+        p.setClipRect(tr)
         p.setFont(fit_font(game_font, self.header_title.title(), tr.width(), 27)); p.setPen(WHITE)
         p.drawText(tr.translated((1 - k) * 60, 0), Qt.AlignVCenter | Qt.AlignRight, self.header_title.title())
         p.restore()
@@ -3061,14 +4020,7 @@ class EmptyState(QWidget):
                    "Open your system_data.bin to edit fighters, items and stats.")
 
 
-STYLE = """
-* { font-family: "Barlow Condensed"; }
-QToolTip { background: #111114; color: #ffffff; border: 2px solid #ffd400; font-size: 15px; font-weight: 700; }
-QScrollBar:vertical { background: rgba(255,255,255,0.06); width: 10px; margin: 0; border: none; }
-QScrollBar::handle:vertical { background: #ffd400; min-height: 30px; border-radius: 3px; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
-"""
+STYLE = stylesheet()
 
 
 def load_fonts():
@@ -3085,23 +4037,11 @@ def load_fonts():
 
 
 def main(argv):
-    """Open a compact desktop window; --fullscreen opts into screen scaling."""
+    """Open a resizable desktop window; --fullscreen uses native Qt fullscreen."""
     global SFX
     windowed = "--fullscreen" not in argv or "--window" in argv
     argv = [a for a in argv if a not in ("--window", "--fullscreen")]
     app = QApplication(argv)
-    if not windowed and not os.environ.get("SMASHER_SCALED"):
-        g = app.primaryScreen().geometry()
-        f = min(g.width() / 1040, g.height() / 590)
-        if abs(f - 1) > 0.02:  # restart once with Qt's own scaling (crisp, not stretched)
-            env = dict(os.environ, SMASHER_SCALED="1",
-                       QT_SCALE_FACTOR=f"{float(os.environ.get('QT_SCALE_FACTOR', '1')) * f:.4f}")
-            os.execve(sys.executable, [sys.executable] + sys.orig_argv[1:], env)
-    if windowed:
-        set_stage(1040, 590)
-    else:
-        g = app.primaryScreen().geometry()
-        set_stage(g.width(), g.height())
     app.setApplicationName("Ultimate Smasher")
     app.setDesktopFileName("ultimate-smasher")
     app.setWindowIcon(QIcon(os.path.join(IMG, "icon.ico")))
@@ -3114,6 +4054,6 @@ def main(argv):
     if windowed:
         win.show()
     else:
-        win.showFullScreen()
+        win.toggle_fullscreen()
     win.activateWindow()
     return app, win

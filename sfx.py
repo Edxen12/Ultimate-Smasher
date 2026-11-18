@@ -4,9 +4,12 @@ import os
 import random
 import shutil
 import struct
-import subprocess
+import tempfile
 import time
 import wave
+from pathlib import Path
+
+from PyQt5.QtCore import QCoreApplication, QProcess
 
 RATE = 22050
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
@@ -70,58 +73,113 @@ SOUNDS = {
 }
 
 
-def _write(path, samples):
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
-        w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, s)) * 32767)) for s in samples))
+def _write(target, samples):
+    with wave.open(target, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(RATE)
+        audio.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, s)) * 32767)) for s in samples))
+
+
+def valid_wav(path):
+    try:
+        with wave.open(str(path), "rb") as audio:
+            frames = audio.getnframes()
+            return (
+                audio.getnchannels() == 1 and audio.getsampwidth() == 2 and audio.getframerate() == RATE
+                and 0 < frames <= RATE * 2 and len(audio.readframes(frames)) == 2 * frames
+            )
+    except (OSError, wave.Error, EOFError):
+        return False
 
 
 def ensure_files():
-    stamp = os.path.join(DIR, ".version")
+    bundled = Path(DIR)
     try:
-        with open(stamp) as f:
-            current = f.read()
-        if current == VERSION and all(os.path.exists(os.path.join(DIR, k + ".wav")) for k in SOUNDS):
-            return
-    except OSError:
+        if (bundled / ".version").read_text() == VERSION and all(
+            valid_wav(bundled / f"{name}.wav") for name in SOUNDS
+        ):
+            return bundled
+    except (OSError, UnicodeError):
         pass
-    os.makedirs(DIR, exist_ok=True)
+    cache = Path(os.environ.get("XDG_CACHE_HOME", ""))
+    if not cache.is_absolute():
+        cache = Path.home() / ".cache"
+    directory = cache / "ultimate-smasher" / "sounds" / VERSION
+    directory.mkdir(parents=True, exist_ok=True)
     for name, make in SOUNDS.items():
-        _write(os.path.join(DIR, name + ".wav"), make())
-    with open(stamp, "w") as f:
-        f.write(VERSION)
+        path = directory / f"{name}.wav"
+        if valid_wav(path):
+            continue
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".sound-", delete=False) as stream:
+            temp = Path(stream.name)
+            try:
+                _write(stream, make())
+                stream.close()
+                temp.replace(path)
+            finally:
+                temp.unlink(missing_ok=True)
+    return directory
 
 
 class Player:
+    MAX_PROCESSES = 6
+
     def __init__(self):
         self.cmd = shutil.which("pw-play") or shutil.which("paplay")
         self.muted = bool(os.environ.get("SMASHER_MUTE")) or self.cmd is None
         self.last = {}
-        self.procs = []
-        if self.cmd:
+        self.procs = set()
+        self.directory = None
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.close)
+
+    def play(self, name, min_gap=0.035):
+        if self.muted or name not in SOUNDS or len(self.procs) >= self.MAX_PROCESSES:
+            return
+        now = time.monotonic()
+        if now - self.last.get(name, float("-inf")) < min_gap:
+            return
+        if self.directory is None:
             try:
-                ensure_files()
+                self.directory = ensure_files()
             except OSError:
                 self.cmd = None
                 self.muted = True
-
-    def play(self, name, min_gap=0.035):
-        if self.muted or name not in SOUNDS:
-            return
-        now = time.monotonic()
-        if now - self.last.get(name, 0) < min_gap:
-            return
+                return
+        process = QProcess()
+        discard = QProcess.nullDevice()
+        process.setStandardOutputFile(discard)
+        process.setStandardErrorFile(discard)
+        process.finished.connect(lambda *_: self.reap(process))
+        process.errorOccurred.connect(lambda error: self.failed(process, error))
+        self.procs.add(process)
         self.last[name] = now
-        self.procs = [p for p in self.procs if p.poll() is None]
-        if len(self.procs) > 6:
-            return
-        try:
-            self.procs.append(subprocess.Popen([self.cmd, os.path.join(DIR, name + ".wav")],
-                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        except OSError:
-            pass
+        process.start(self.cmd, [str(self.directory / f"{name}.wav")])
+
+    def reap(self, process):
+        self.procs.discard(process)
+        process.deleteLater()
+
+    def failed(self, process, error):
+        if error == QProcess.FailedToStart:
+            self.reap(process)
+            self.muted = True
+            self.cmd = None
+
+    def stop(self):
+        for process in tuple(self.procs):
+            process.kill()
+
+    def close(self):
+        self.stop()
+        for process in tuple(self.procs):
+            process.waitForFinished(250)
 
     def toggle(self):
         if self.cmd:
             self.muted = not self.muted
+            if self.muted:
+                self.stop()
         return not self.muted
