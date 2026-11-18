@@ -191,12 +191,16 @@ class UiSmokeTest(unittest.TestCase):
         self.assertEqual(page.save.value(f), f.maximum)
         w.show_hub(); pump()
 
-    def test_12_every_fighter_has_series_and_stock_art(self):
-        for name, img in smash_ui.sd.FIGHTERS:
-            self.assertFalse(smash_ui.series_mark(img).isNull(), name)
-            self.assertFalse(smash_ui.pixmap(f"stock/{img}.png").isNull(), name)
-            self.assertFalse(smash_ui.pixmap(f"portraits/{img}.png").isNull(), name)
-            self.assertFalse(smash_ui.pixmap(f"renders/{img}.png").isNull(), name)
+    def test_12_roster_paints_without_optional_art(self):
+        w = self.win
+        with tempfile.TemporaryDirectory() as img, patch.object(smash_ui, "IMG", img), patch.object(smash_ui, "_PIX", {}):
+            w.open_section("CHARACTERS")
+            page = w.pages[w.current]
+            with patch.multiple(page.tiles[0], src=smash_ui.QPixmap(), _gray={}):
+                page.preview(0)
+                self.assertFalse(page.tiles[0].grab().isNull())
+                self.assertFalse(page.grab().isNull())
+            w.show_hub()
 
     def test_13_rail_reachable_with_keys(self):
         w = self.win
@@ -705,7 +709,7 @@ class UiSmokeTest(unittest.TestCase):
         self.assertIn("Nunito", fams)
         self.assertIn("Barlow Condensed", fams)
         hub = self.win.hub
-        self.assertGreaterEqual(hub.art.width(), 400)
+        self.assertFalse(smash_ui.pixmap("ui/app.svg").isNull())
         self.win.show_hub(); pump(200)
         for size in ((1040, 590), (1280, 1024), (1920, 1080), (3840, 2160)):
             hub.resize(*size)

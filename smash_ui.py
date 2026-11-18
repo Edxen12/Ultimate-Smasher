@@ -76,6 +76,7 @@ from save_jobs import DiskJob
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(BASE, "img")
+APP_ICON = os.path.join(IMG, "ui", "app.svg")
 APP_TITLE = "ULTIMATE SMASHER"
 
 W, H = 1040, 590
@@ -2029,6 +2030,9 @@ class Hub(QWidget):
         p.save(); p.setClipPath(clip)
         if self.art.isNull():
             p.fillRect(clip.boundingRect(), QColor("#202020"))
+            side = hg.ART_R * 1.15
+            mark = QRectF(c.x() - side / 2, c.y() - side / 2, side, side)
+            QIcon(APP_ICON).paint(p, mark.toRect())
         else:
             p.drawPixmap(QRectF(c.x() - hg.ART_R - 1, c.y() - hg.ART_R - 1, 2 * hg.ART_R + 2, 2 * hg.ART_R + 2),
                          self.art, QRectF(self.art.rect()))
@@ -2653,7 +2657,12 @@ class FighterTile(AnimButton):
         face = QRectF(r)
         p.fillRect(r, QColor("#111111"))
         pm = self.art("portrait")
-        p.drawPixmap(face, pm, portrait_source(pm, face.width() / face.height()))
+        if pm.isNull():
+            p.setFont(fa_font(max(16, face.height() * 0.34)))
+            p.setPen(QColor("#8c8f9b"))
+            p.drawText(face.adjusted(0, 0, 0, -band), Qt.AlignCenter, G["fighters"])
+        else:
+            p.drawPixmap(face, pm, portrait_source(pm, face.width() / face.height()))
         if not self.unlocked:
             p.fillRect(face, QColor(10, 10, 14, 70))
             lock_rect = QRectF(r.right() - 24, r.top() + 4, 20, 20)
@@ -2887,8 +2896,13 @@ class CharactersPage(Page):
             p.setOpacity(1.0)
         else:
             pm = tile.art("portrait")
-            shot = fit_pixmap_rect(QSize(94, 62), portrait.adjusted(12, 12, -12, -12))
-            p.drawPixmap(shot, pm, portrait_source(pm, 94 / 62))
+            if pm.isNull():
+                p.setFont(fa_font(max(20, h * 0.42)))
+                p.setPen(WHITE)
+                p.drawText(portrait, Qt.AlignCenter, G["fighters"])
+            else:
+                shot = fit_pixmap_rect(QSize(94, 62), portrait.adjusted(12, 12, -12, -12))
+                p.drawPixmap(shot, pm, portrait_source(pm, 94 / 62))
         p.restore()
         x = portrait.right() + 12
         p.setFont(label_font(15)); p.setPen(WHITE)
@@ -3309,7 +3323,7 @@ class MainWindow(QWidget):
     def __init__(self, path=None):
         super().__init__(None)
         self.setWindowTitle("Ultimate Smasher")
-        self.setWindowIcon(QIcon(os.path.join(IMG, "icon.ico")))
+        self.setWindowIcon(QIcon(APP_ICON))
         self.setMinimumSize(W, H)
         self.resize(W, H)
         self._was_maximized = False
@@ -4044,7 +4058,7 @@ def main(argv):
     app = QApplication(argv)
     app.setApplicationName("Ultimate Smasher")
     app.setDesktopFileName("ultimate-smasher")
-    app.setWindowIcon(QIcon(os.path.join(IMG, "icon.ico")))
+    app.setWindowIcon(QIcon(APP_ICON))
     app.setStyle("fusion")
     app.setStyleSheet(STYLE)
     load_fonts()

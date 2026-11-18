@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 sounds/
 .ruff_cache/
+.venv/
+*.bin
+*.bin.*
+/img/hub-art.png
+/img/portraits/
+/img/renders/
+/img/series/
+/img/stock/
