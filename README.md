@@ -22,7 +22,7 @@ scaled to the screen with Qt's high-DPI scaling; `--window` is also accepted.
 Saving writes atomically, keeps both Ryujinx commit slots (`0/` and `1/`) identical and
 warns if Ryujinx is running. Unsaved changes are confirmed before quitting or opening another file.
 
-Keys: arrows + Enter · Esc back (quit from the main menu) · Q / E change section · Ctrl+O open ·
+Keys: arrows + Enter (→ from the right-hand tiles reaches the side rail) · Esc back (quit from the main menu) · Q / E change section · Ctrl+O open ·
 Ctrl+S save · M sound on/off · F1 help.
 
 Controller (read straight from `/dev/input`, needs the `input` group; hot-plug supported):

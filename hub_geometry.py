@@ -43,6 +43,9 @@ NEIGHBORS = {
     "SAVE": {Qt.Key_Left: "STATS", Qt.Key_Up: "BACKUPS"},
 }
 
+# Right-edge tiles step into the side rail with Right (index of the rail item).
+RAIL_ENTRY = {"GENERAL": 1, "BACKUPS": 2, "SAVE": 3}
+
 
 def _tiles():
     cut = QPainterPath(); cut.addEllipse(DISC_C, CUT_R, CUT_R)

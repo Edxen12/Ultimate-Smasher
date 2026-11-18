@@ -1501,6 +1501,7 @@ class Hub(QWidget):
         self.tile_info = {}
         self.hover = "CHARACTERS"
         self.rail_hover = None
+        self._before_rail = None
         self.flash = {name: 0.0 for name in HUB_TILES}
         self.intro = 1.0
         self.angle = self._angle("CHARACTERS")
@@ -1580,10 +1581,13 @@ class Hub(QWidget):
         name = self.tile_at(event.pos())
         if name:
             self.set_hover(name)
+        elif rail is not None and self.hover:
+            self._before_rail = self.hover
         self.setCursor(Qt.PointingHandCursor if name or rail is not None else Qt.ArrowCursor)
 
     def leaveEvent(self, event):
-        self.rail_hover = None; self.update()
+        if self.hover:              # keyboard focus on the rail survives the mouse leaving
+            self.rail_hover = None; self.update()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -1597,11 +1601,32 @@ class Hub(QWidget):
             self.set_hover(name)
             self.activate(name)
 
+    def set_rail(self, i):
+        if i != self.rail_hover:
+            self.rail_hover = i
+            if i is not None:
+                play("move")
+            self.update()
+
     def keyPressEvent(self, event):
         key = event.key()
-        if key in ARROWS:
+        enter = key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space)
+        if self.rail_hover is not None and (key in ARROWS or enter):
+            if key == Qt.Key_Left:
+                self.set_rail(None)
+                self.set_hover(self._before_rail or "GENERAL"); self.update()
+            elif key in (Qt.Key_Up, Qt.Key_Down):
+                step = -1 if key == Qt.Key_Up else 1
+                self.set_rail(max(0, min(len(RAIL) - 1, self.rail_hover + step)))
+            elif enter:
+                self.rail_action(self.rail_hover)
+        elif key == Qt.Key_Right and self.hover in hg.RAIL_ENTRY:
+            self._before_rail = self.hover
+            self.set_rail(hg.RAIL_ENTRY[self.hover])
+            self.hover = None; self.update()
+        elif key in ARROWS:
             self.set_hover(hg.NEIGHBORS[self.hover or "CHARACTERS"].get(key, self.hover or "CHARACTERS"))
-        elif key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space) and self.hover:
+        elif enter and self.hover:
             self.activate(self.hover)
         elif key == Qt.Key_Escape and self.on_back:
             self.on_back()
@@ -1609,7 +1634,7 @@ class Hub(QWidget):
             super().keyPressEvent(event)
 
     def focusInEvent(self, event):
-        if not self.hover:
+        if not self.hover and self.rail_hover is None:
             self.set_hover("CHARACTERS")
 
     def rail_action(self, i):
@@ -1793,6 +1818,9 @@ class Hub(QWidget):
             if i == 2 and muted:
                 icon = "\uf6a9"
             on = i == active
+            if on and self.rail_hover is not None:
+                p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 34))
+                p.drawRoundedRect(rect.adjusted(-6, -4, 6, 4), 22, 22)
             p.setFont(fa_font(62))
             p.setPen(QColor(0, 0, 0)); p.drawText(rect.translated(3, 4), Qt.AlignCenter, icon)
             p.setPen(WHITE if on else QColor("#c9c9c9")); p.drawText(rect, Qt.AlignCenter, icon)
@@ -1837,8 +1865,7 @@ class Hub(QWidget):
             p.drawText(r, Qt.AlignCenter, "UNSAVED")
 
     def static_layer(self, size, dpr):
-        key = (size.width(), size.height(), dpr, self.hover, self.win.store.dirty,
-               bool(SFX and SFX.muted), tuple(sorted(self.tile_info.items())))
+        key = (size.width(), size.height(), dpr, self.hover, self.win.store.dirty)
         if self._cache and self._cache[0] == key:
             return self._cache[1]
         pm = QPixmap(int(size.width() * dpr), int(size.height() * dpr)); pm.setDevicePixelRatio(dpr)
@@ -2180,13 +2207,19 @@ class FighterTile(AnimButton):
         self.img = img
         self.sfx = None
         self.setFocusPolicy(Qt.StrongFocus)
-        src = pixmap(f"portraits/{img}.png")
-        self.src = src
-        self.src_locked = grayscale(src)
-        self.render = pixmap(f"renders/{img}.png")
-        self.render_locked = grayscale(self.render)
+        self.src = pixmap(f"portraits/{img}.png")
+        self._gray = {}
         self.unlocked = True
         self.pop = 0.0
+
+    def art(self, kind):
+        """Portrait or render, grey when locked; loaded lazily (only one is shown at a time)."""
+        pm = self.src if kind == "portrait" else pixmap(f"renders/{self.img}.png")
+        if self.unlocked:
+            return pm
+        if kind not in self._gray:
+            self._gray[kind] = grayscale(pm)
+        return self._gray[kind]
 
     def enterEvent(self, event):
         super().enterEvent(event)
@@ -2222,7 +2255,7 @@ class FighterTile(AnimButton):
         band = max(10.0, r.height() * 0.27)
         face = QRectF(r.left(), r.top(), r.width(), r.height() - band)
         p.fillRect(r, QColor("#111111"))
-        pm = self.src if self.unlocked else self.src_locked
+        pm = self.art("portrait")
         p.drawPixmap(face, pm, portrait_source(pm, face.width() / face.height()))
         if not self.unlocked:
             p.fillRect(face, QColor(10, 10, 14, 150))
@@ -2341,7 +2374,7 @@ class CharactersPage(Page):
             p.setOpacity(0.3)
             p.drawPixmap(QRectF(card.right() - ms - 18, card.center().y() - ms / 2, ms, ms), mark, QRectF(mark.rect()))
             p.setOpacity(1.0)
-        render = tile.render if tile.unlocked else tile.render_locked
+        render = tile.art("render")
         if not render.isNull():
             # Big fighter render, cropped to head and shoulders like the game's player panel.
             side = h * 2.1
@@ -2350,7 +2383,7 @@ class CharactersPage(Page):
             p.drawPixmap(target, render, QRectF(render.rect()))
             p.setOpacity(1.0)
         else:
-            pm = tile.src if tile.unlocked else tile.src_locked
+            pm = tile.art("portrait")
             shot = fit_pixmap_rect(QSize(94, 62), portrait.adjusted(12, 12, -12, -12))
             p.drawPixmap(shot, pm, portrait_source(pm, 94 / 62))
         p.restore()

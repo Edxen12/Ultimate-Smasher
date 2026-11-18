@@ -190,6 +190,23 @@ class UiSmokeTest(unittest.TestCase):
             self.assertFalse(smash_ui.pixmap(f"portraits/{img}.png").isNull(), name)
             self.assertFalse(smash_ui.pixmap(f"renders/{img}.png").isNull(), name)
 
+    def test_13_rail_reachable_with_keys(self):
+        w = self.win
+        w.show_hub(); pump(300)
+        hub = w.hub
+        hub.set_hover("GENERAL")
+        QTest.keyClick(hub, Qt.Key_Right); pump()
+        self.assertEqual(hub.rail_hover, 1)
+        self.assertIsNone(hub.hover)
+        QTest.keyClick(hub, Qt.Key_Down); QTest.keyClick(hub, Qt.Key_Down); pump()
+        self.assertEqual(hub.rail_hover, 3)
+        QTest.keyClick(hub, Qt.Key_Return); pump(450)
+        self.assertIsInstance(self.overlays()[-1], smash_ui.HelpOverlay)
+        self.overlays()[-1].close_overlay(); pump(250)
+        QTest.keyClick(hub, Qt.Key_Left); pump()
+        self.assertIsNone(hub.rail_hover)
+        self.assertEqual(hub.hover, "GENERAL")
+
     def test_10_portraits_never_overscaled(self):
         from PyQt5.QtCore import QRectF, QSize
         r = smash_ui.fit_pixmap_rect(QSize(94, 62), QRectF(0, 0, 600, 400))
