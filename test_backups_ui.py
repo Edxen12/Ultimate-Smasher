@@ -13,10 +13,11 @@ from PyQt5.QtTest import QTest
 import save_data as sd
 import smash_ui as ui
 tmp = tempfile.TemporaryDirectory()
-path = os.path.join(tmp.name, 'system_data.bin')
+directory = os.path.realpath(tmp.name)
+path = os.path.join(directory, 'system_data.bin')
 with open(path, 'wb') as stream:
     stream.write(bytes(sd.SAVE_SIZE))
-sd.BACKUP_DIR = os.path.join(tmp.name, 'backups')
+sd.BACKUP_DIR = os.path.join(directory, 'backups')
 app, win = ui.main(['test', path])
 def wait_for_idle():
     for _ in range(200):
@@ -137,7 +138,7 @@ class BackupUiTest(unittest.TestCase):
 
     def test_filter_current_source_and_warn_on_foreign_backup(self):
         self.run_ui("""
-            foreign = os.path.join(tmp.name, 'another.bin')
+            foreign = os.path.join(directory, 'another.bin')
             with open(foreign, 'wb') as stream:
                 stream.write(bytes(sd.SAVE_SIZE))
             sd.make_backup([path])

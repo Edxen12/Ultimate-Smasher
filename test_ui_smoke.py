@@ -24,7 +24,7 @@ def pump(ms=60):
 class UiSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp()
+        cls.tmp = os.path.realpath(tempfile.mkdtemp())
         cls.slot0 = os.path.join(cls.tmp, "0", "save_data")
         cls.slot1 = os.path.join(cls.tmp, "1", "save_data")
         os.makedirs(cls.slot0); os.makedirs(cls.slot1)

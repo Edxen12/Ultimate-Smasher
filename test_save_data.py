@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
 import save_data as sd
@@ -309,6 +309,44 @@ class SaveDataTest(unittest.TestCase):
         os.makedirs(stage)
         shutil.copy2(self.path, os.path.join(stage, "system_data.bin"))
         self.assertEqual(len(sd.list_backups(self.backups)), 1)
+
+    def test_manual_backup_waits_for_both_slots_to_commit(self):
+        editor = sd.SaveFile(self.path)
+        reader = sd.SaveFile(self.other)
+        editor.set_value(sd.TICKETS, (editor.value(sd.TICKETS) + 1) % 99)
+        updated_first, backup_attempted, resume = Event(), Event(), Event()
+        atomic_write = sd._atomic_write
+        lock = sd._lock_save_directory
+
+        def pause_between_slots(path, data, **options):
+            atomic_write(path, data, **options)
+            if path == self.path:
+                updated_first.set()
+                if not resume.wait(10):
+                    raise TimeoutError("Test never released the writer")
+
+        def observe_lock(path):
+            if path == self.other:
+                backup_attempted.set()
+            return lock(path)
+
+        with (
+            patch.object(sd, "_atomic_write", side_effect=pause_between_slots),
+            patch.object(sd, "_lock_save_directory", side_effect=observe_lock),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            saving = pool.submit(editor.save, self.backups)
+            try:
+                self.assertTrue(updated_first.wait(10))
+                backup = pool.submit(reader.backup, self.backups)
+                self.assertTrue(backup_attempted.wait(10))
+            finally:
+                resume.set()
+            saving.result(timeout=10)
+            folder = backup.result(timeout=10)
+        for slot in (0, 1):
+            raw = sd.read_backup(os.path.join(folder, f"slot{slot}_system_data.bin"))
+            self.assertEqual(raw, bytes(editor.data))
 
     def test_failed_backup_never_publishes_or_prunes(self):
         dest = sd.make_backup([self.path], self.backups)

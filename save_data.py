@@ -547,6 +547,13 @@ class SaveFile:
         self.data = bytearray(raw)
 
     # --- saving ---------------------------------------------------------
+    def backup(self, backup_dir=None, *, prune=True):
+        """Capture both disk slots while excluding this editor's concurrent saves."""
+        with _lock_save_directory(self.path):
+            other = mirror_path(self.path)
+            paths = [self.path, other] if other else [self.path]
+            return make_backup(paths, backup_dir, prune=prune)
+
     def export_copy(self, path):
         """Publish the edited bytes at a new path without changing the open save."""
         payload = bytes(self.data)

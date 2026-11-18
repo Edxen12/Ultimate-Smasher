@@ -3306,9 +3306,7 @@ class BackupsPage(Page):
         if not self.save:
             self.app.toast("OPEN A SAVE FIRST", "error")
             return
-        other = sd.mirror_path(self.save.path)
-        targets = [self.save.path] + ([other] if other else [])
-        self.app.create_backup(targets, self)
+        self.app.create_backup(self.save, self)
 
     def open_folder(self):
         try:
@@ -3885,9 +3883,9 @@ class MainWindow(QWidget):
         QTimer.singleShot(180, show_progress)
         QThreadPool.globalInstance().start(job)
 
-    def create_backup(self, targets, page):
+    def create_backup(self, save, page):
         def backup():
-            dest = sd.make_backup(targets, prune=False)
+            dest = save.backup(prune=False)
             warning = None
             if dest:
                 try:
