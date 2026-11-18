@@ -1,11 +1,14 @@
-"""Read game controllers straight from /dev/input (no extra packages) and turn
-them into editor controls: D-pad/left stick = arrows, Cross/A = Enter, Circle/B = Esc,
-L1/R1 = previous/next section, Options/Start = Ctrl+S, Share/Select = F1."""
-import fcntl
+"""Translate Linux evdev and Windows XInput controllers into editor controls."""
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass, field
+
+if sys.platform.startswith("linux"):
+    import fcntl
+else:
+    fcntl = None
 
 from PyQt5 import sip
 from PyQt5.QtCore import QEvent, QObject, QSocketNotifier, Qt, QTimer, pyqtSignal
@@ -30,6 +33,43 @@ BUTTONS = {
 }
 SECTION_BUTTONS = {310: -1, 311: 1}          # L1 / R1
 ABSINFO = struct.Struct("6i")  # value, min, max, fuzz, flat, resolution
+XINPUT_DPAD = {
+    0x0001: BTN_DPAD_UP, 0x0002: BTN_DPAD_DOWN,
+    0x0004: BTN_DPAD_LEFT, 0x0008: BTN_DPAD_RIGHT,
+}
+XINPUT_BUTTONS = {0x0010: 315, 0x0020: 314, 0x0100: 310, 0x0200: 311, 0x1000: BTN_SOUTH, 0x2000: 305}
+
+
+def open_xinput():
+    """Return a state reader backed by the Windows system DLL."""
+    import ctypes
+
+    class State(ctypes.Structure):
+        _fields_ = [
+            ("packet", ctypes.c_uint32), ("buttons", ctypes.c_uint16),
+            ("left_trigger", ctypes.c_ubyte), ("right_trigger", ctypes.c_ubyte),
+            ("left_x", ctypes.c_int16), ("left_y", ctypes.c_int16),
+            ("right_x", ctypes.c_int16), ("right_y", ctypes.c_int16),
+        ]
+
+    for dll in ("xinput1_4", "xinput9_1_0"):
+        try:
+            get_state = ctypes.WinDLL(dll, winmode=0x800).XInputGetState  # Search System32 only.
+        except (OSError, AttributeError):
+            continue
+        get_state.argtypes = (ctypes.c_uint32, ctypes.POINTER(State))
+        get_state.restype = ctypes.c_uint32
+        break
+    else:
+        return None
+
+    def read(slot):
+        state = State()
+        if get_state(slot, ctypes.byref(state)) != 0:
+            return None
+        return state.buttons, state.left_x, -1 - state.left_y
+
+    return read
 
 
 def axis_range(fd, code):
@@ -64,16 +104,23 @@ def has_gamepad_keys(block):
 
 @dataclass(eq=False)
 class Device:
-    fd: int
-    notifier: QSocketNotifier
+    fd: int | None
+    notifier: QSocketNotifier | None
     ranges: dict
     axes: dict = field(default_factory=lambda: dict.fromkeys(STICK_AXES + HAT_AXES, 0))
     dpad: set = field(default_factory=set)
     lost_sync: bool = False
+    xinput_state: tuple[int, int, int] | None = None
 
     def reset_axes(self):
         self.axes = dict.fromkeys(self.axes, 0)
         self.dpad.clear()
+
+    def set_axis(self, code, value):
+        if code in STICK_AXES:
+            lo, hi = self.ranges[code]
+            value = 2 * (value - lo) / (hi - lo) - 1
+        self.axes[code] = value
 
     def direction(self):
         hx, hy = (self.axes[axis] for axis in HAT_AXES)
@@ -104,11 +151,19 @@ class Gamepad(QObject):
         self.repeat = QTimer(self)
         self.repeat.timeout.connect(self._repeat)
         self.scanner = QTimer(self)
-        self.scanner.timeout.connect(self.scan)
+        self.xinput = None
         self.win.installEventFilter(self)
         self.win.destroyed.connect(self.close_devices)
-        self.scanner.start(2000)
-        self.scan()
+        if fcntl is not None:
+            self.scanner.timeout.connect(self.scan)
+            self.scanner.start(2000)
+            self.scan()
+        elif sys.platform == "win32":
+            self.xinput = open_xinput()
+            if self.xinput is not None:
+                self.scanner.timeout.connect(self.poll_xinput)
+                self.scanner.start(350)
+                self.poll_xinput()
 
     @property
     def connected(self):
@@ -152,12 +207,13 @@ class Gamepad(QObject):
 
     def close_device(self, path):
         device = self.devs.pop(path)
-        device.notifier.setEnabled(False)
-        device.notifier.deleteLater()
-        try:
-            os.close(device.fd)
-        except OSError:
-            pass
+        if device.notifier is not None:
+            device.notifier.setEnabled(False)
+            device.notifier.deleteLater()
+            try:
+                os.close(device.fd)
+            except OSError:
+                pass
         self.release_device(device)
 
     def close_devices(self):
@@ -181,6 +237,41 @@ class Gamepad(QObject):
         for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
             _, _, typ, code, val = EVENT.unpack_from(data, i)
             self.handle(device, typ, code, val)
+
+    def poll_xinput(self):
+        before = self.connected
+        for slot in range(4):
+            sample = self.xinput(slot)
+            device = self.devs.get(slot)
+            if sample is None:
+                if device is not None:
+                    self.close_device(slot)
+            elif device is None:
+                ranges = dict.fromkeys(STICK_AXES, (-32768, 32767))
+                self.devs[slot] = Device(None, None, ranges, xinput_state=sample)
+            else:
+                self.handle_xinput(device, sample)
+        interval = 24 if self.connected else 350
+        if self.scanner.interval() != interval:
+            self.scanner.setInterval(interval)
+        if self.connected != before:
+            self.connected_changed.emit(self.connected)
+
+    def handle_xinput(self, device, sample):
+        old_buttons, old_x, old_y = device.xinput_state
+        device.xinput_state = sample
+        if (old_buttons, old_x, old_y) == sample or not self.can_send():
+            return
+        buttons, x, y = sample
+        previous = device.direction()
+        device.dpad = {key for mask, key in XINPUT_DPAD.items() if buttons & mask}
+        device.set_axis(0, x)
+        device.set_axis(1, y)
+        self.update_direction(device, previous)
+        pressed = buttons & ~old_buttons
+        for mask, key in XINPUT_BUTTONS.items():
+            if pressed & mask:
+                self.handle(device, EV_KEY, key, 1)
 
     # ----------------------------------------------------------- events --
     def eventFilter(self, obj, event):
@@ -243,10 +334,7 @@ class Gamepad(QObject):
 
     def handle_axis(self, device, code, val):
         previous = device.direction()
-        if code in STICK_AXES:
-            lo, hi = device.ranges[code]
-            val = (2 * (val - lo) / (hi - lo)) - 1
-        device.axes[code] = val
+        device.set_axis(code, val)
         self.update_direction(device, previous)
 
     def update_direction(self, device, previous):

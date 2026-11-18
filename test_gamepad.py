@@ -25,7 +25,7 @@ class GamepadTest(unittest.TestCase):
 
     def setUp(self):
         self.window = QWidget()
-        with patch.object(gamepad.Gamepad, "scan"):
+        with patch.object(gamepad.Gamepad, "scan"), patch.object(gamepad, "open_xinput", return_value=None):
             self.pad = gamepad.Gamepad(self.window)
         self.pad.scanner.stop()
         self.pad.can_send = Mock(return_value=True)
@@ -115,6 +115,7 @@ class GamepadTest(unittest.TestCase):
         self.assertEqual(steps.call_args_list, [call(-1), call(1)])
         self.pad.send.assert_not_called()
 
+    @unittest.skipUnless(gamepad.fcntl is not None, "Linux evdev discovery")
     def test_scan_detects_controller_without_joydev(self):
         word, bit = divmod(gamepad.BTN_SOUTH, gamepad.KEY_WORD_BITS)
         bitmap = " ".join([f"{1 << bit:x}"] + ["0"] * word)
@@ -134,6 +135,28 @@ class GamepadTest(unittest.TestCase):
             self.pad.scan()
         open_device.assert_called_once_with("/dev/input/event0", os.O_RDONLY | os.O_NONBLOCK)
         self.assertIn("/dev/input/event0", self.pad.devs)
+
+    def test_xinput_ignores_buttons_held_at_connect_and_releases_on_unplug(self):
+        self.pad.devs.clear()
+        self.pad.xinput = Mock(side_effect=lambda slot: sample if slot == 0 else None)
+        connected = Mock()
+        self.pad.connected_changed.connect(connected)
+        sample = (0x0010, 0, 0)  # Start is already held.
+        self.pad.poll_xinput()
+        self.pad.send.assert_not_called()
+
+        sample = (0, 0, 0)
+        self.pad.poll_xinput()
+        sample = (0x1008, 0, 0)  # Right plus A.
+        self.pad.poll_xinput()
+        self.pad.poll_xinput()
+        self.assertEqual(self.pad.send.call_args_list, [call(Qt.Key_Right), call(Qt.Key_Return, Qt.NoModifier)])
+
+        sample = None
+        self.pad.poll_xinput()
+        self.assertIsNone(self.pad.held)
+        self.assertFalse(self.pad.repeat.isActive())
+        self.assertEqual(connected.call_args_list, [call(True), call(False)])
 
     def test_digital_dpad_repeats_and_releases(self):
         for value in (1, 2):

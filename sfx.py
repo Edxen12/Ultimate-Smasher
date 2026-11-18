@@ -1,15 +1,21 @@
-"""Original UI sound effects, synthesised in pure Python and played with pw-play/paplay."""
+"""Synthesise original UI sounds and play them with the desktop audio backend."""
 import math
 import os
 import random
 import shutil
 import struct
+import sys
 import tempfile
 import time
 import wave
 from pathlib import Path
 
-from PyQt5.QtCore import QCoreApplication, QProcess
+from PyQt5.QtCore import QCoreApplication, QProcess, QStandardPaths
+
+if sys.platform == "win32":
+    import winsound
+else:
+    winsound = None
 
 RATE = 22050
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
@@ -104,20 +110,22 @@ def ensure_files():
         pass
     cache = Path(os.environ.get("XDG_CACHE_HOME", ""))
     if not cache.is_absolute():
-        cache = Path.home() / ".cache"
+        location = QStandardPaths.writableLocation(QStandardPaths.GenericCacheLocation)
+        cache = Path(location) if location else Path.home() / ".cache"
     directory = cache / "ultimate-smasher" / "sounds" / VERSION
     directory.mkdir(parents=True, exist_ok=True)
     for name, make in SOUNDS.items():
         path = directory / f"{name}.wav"
         if valid_wav(path):
             continue
-        with tempfile.NamedTemporaryFile(dir=directory, prefix=".sound-", delete=False) as stream:
-            temp = Path(stream.name)
-            try:
+        temp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".sound-", delete=False) as stream:
+                temp = Path(stream.name)
                 _write(stream, make())
-                stream.close()
-                temp.replace(path)
-            finally:
+            temp.replace(path)
+        finally:
+            if temp is not None:
                 temp.unlink(missing_ok=True)
     return directory
 
@@ -126,8 +134,15 @@ class Player:
     MAX_PROCESSES = 6
 
     def __init__(self):
-        self.cmd = shutil.which("pw-play") or shutil.which("paplay")
-        self.muted = bool(os.environ.get("SMASHER_MUTE")) or self.cmd is None
+        self.native = winsound
+        self.playing_native = False
+        if self.native is not None:
+            self.cmd = None
+        elif sys.platform == "darwin":
+            self.cmd = shutil.which("afplay")
+        else:
+            self.cmd = shutil.which("pw-play") or shutil.which("paplay")
+        self.muted = bool(os.environ.get("SMASHER_MUTE")) or (self.cmd is None and self.native is None)
         self.last = {}
         self.procs = set()
         self.directory = None
@@ -146,8 +161,19 @@ class Player:
                 self.directory = ensure_files()
             except OSError:
                 self.cmd = None
+                self.native = None
                 self.muted = True
                 return
+        path = str(self.directory / f"{name}.wav")
+        self.last[name] = now
+        if self.native is not None:
+            try:
+                flags = self.native.SND_FILENAME | self.native.SND_ASYNC | self.native.SND_NODEFAULT
+                self.native.PlaySound(path, flags)
+                self.playing_native = True
+            except RuntimeError:
+                self.muted = True
+            return
         process = QProcess()
         discard = QProcess.nullDevice()
         process.setStandardOutputFile(discard)
@@ -155,8 +181,7 @@ class Player:
         process.finished.connect(lambda *_: self.reap(process))
         process.errorOccurred.connect(lambda error: self.failed(process, error))
         self.procs.add(process)
-        self.last[name] = now
-        process.start(self.cmd, [str(self.directory / f"{name}.wav")])
+        process.start(self.cmd, [path])
 
     def reap(self, process):
         self.procs.discard(process)
@@ -169,6 +194,12 @@ class Player:
             self.cmd = None
 
     def stop(self):
+        if self.playing_native:
+            try:
+                self.native.PlaySound(None, 0)
+            except RuntimeError:
+                pass
+            self.playing_native = False
         for process in tuple(self.procs):
             process.kill()
 
@@ -178,7 +209,7 @@ class Player:
             process.waitForFinished(250)
 
     def toggle(self):
-        if self.cmd:
+        if self.cmd or self.native is not None:
             self.muted = not self.muted
             if self.muted:
                 self.stop()

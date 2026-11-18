@@ -3,9 +3,7 @@
 All offsets come from the original Ultimate Smasher (Ret-HZ, 2019); the fighter
 table offsets were corrected locally (8-byte slots from 0x53FF40, official order).
 """
-import ctypes
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -13,13 +11,21 @@ import re
 import shutil
 import stat
 import struct
+import sys
 import tempfile
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
+_WINDOWS = os.name == "nt"
+if _WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 SAVE_SIZE = 5982968
-_RYUJINX_PRIMARY_SAVE = "Ryujinx/bis/user/save/0000000000000001/0/save_data/system_data.bin"
+_RYUJINX_PRIMARY_SAVE = os.path.join("Ryujinx", "bis", "user", "save", "0000000000000001",
+                                    "0", "save_data", "system_data.bin")
 RYUJINX_SAVE = os.path.join(
     os.path.expanduser("~/.var/app/io.github.ryubing.Ryujinx/config"), _RYUJINX_PRIMARY_SAVE)
 BACKUP_DIR = os.path.expanduser("~/Games/Switch/smash-save-backups")
@@ -29,6 +35,8 @@ _BACKUP_FILES = {"system_data.bin", "slot0_system_data.bin", "slot1_system_data.
 _UNCHECKED = object()
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 FMT = {1: "<B", 2: "<H", 4: "<I"}
 
@@ -166,15 +174,25 @@ STATS = {
 
 
 def default_save_path():
+    home = os.path.expanduser("~")
     native_config = os.environ.get("XDG_CONFIG_HOME", "")
     if not os.path.isabs(native_config):
-        native_config = os.path.expanduser("~/.config")
-    legacy_config = os.path.expanduser("~/.var/app/org.ryujinx.Ryujinx/config")
-    candidates = (
-        RYUJINX_SAVE,
-        os.path.join(legacy_config, _RYUJINX_PRIMARY_SAVE),
-        os.path.join(native_config, _RYUJINX_PRIMARY_SAVE),
-    )
+        native_config = os.path.join(home, ".config")
+    if _WINDOWS:
+        appdata = os.environ.get("APPDATA", "")
+        if not os.path.isabs(appdata):
+            appdata = os.path.join(home, "AppData", "Roaming")
+        candidates = (os.path.join(appdata, _RYUJINX_PRIMARY_SAVE),)
+    elif sys.platform == "darwin":
+        candidates = tuple(os.path.join(root, _RYUJINX_PRIMARY_SAVE) for root in
+                           (os.path.join(home, "Library", "Application Support"), native_config))
+    else:
+        legacy_config = os.path.join(home, ".var", "app", "org.ryujinx.Ryujinx", "config")
+        candidates = (
+            RYUJINX_SAVE,
+            os.path.join(legacy_config, _RYUJINX_PRIMARY_SAVE),
+            os.path.join(native_config, _RYUJINX_PRIMARY_SAVE),
+        )
     for path in candidates:
         try:
             info = os.stat(path)
@@ -205,24 +223,59 @@ def mirror_path(path):
 
 
 def ryujinx_running():
+    if _WINDOWS:
+        import csv
+
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        tasklist = os.path.join(system_root, "System32", "tasklist.exe")
+        names = (row[0] for row in csv.reader(_process_list(
+            [tasklist, "/fo", "csv", "/nh"], hide_window=True)) if row)
+    elif sys.platform == "darwin":
+        names = _process_list(["/bin/ps", "-A", "-o", "comm="])
+    else:
+        names = _proc_names()
+    return any(os.path.basename(name.strip()).casefold().startswith(("ryujinx", "ryubing"))
+               for name in names)
+
+
+def _process_list(command, *, hide_window=False):
+    import subprocess
+
+    flags = subprocess.CREATE_NO_WINDOW if hide_window else 0
+    try:
+        output = subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=1.0, creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return output.decode("utf-8", errors="replace").splitlines()
+
+
+def _proc_names():
     me = os.getpid()
-    for pid in os.listdir("/proc"):
+    try:
+        processes = os.listdir("/proc")
+    except OSError:
+        return
+    for pid in processes:
         if not pid.isdigit() or int(pid) == me:
             continue
         try:
             with open(f"/proc/{pid}/comm") as f:
-                comm = f.read().strip().lower()
+                yield f.read()
         except OSError:
             continue
-        if comm.startswith("ryujinx"):
-            return True
-    return False
 
 
 def _sync_directory(path):
+    # The Windows CRT cannot open a directory for fsync. File data is synced
+    # before every rename on all platforms.
+    if _WINDOWS:
+        return
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
+    except OSError as error:
+        if sys.platform != "darwin" or error.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
     finally:
         os.close(fd)
 
@@ -230,12 +283,19 @@ def _sync_directory(path):
 def _read_disk(path):
     """Read a bounded snapshot; None represents a missing commit slot."""
     def regular_file(name, flags):
-        return os.open(name, flags | os.O_NONBLOCK | os.O_NOFOLLOW)
+        if not _NOFOLLOW and not stat.S_ISREG(os.lstat(name).st_mode):
+            raise OSError(errno.EINVAL, "Expected a regular save file", name)
+        return os.open(name, flags | _NONBLOCK | _NOFOLLOW)
 
     try:
         with open(path, "rb", opener=regular_file) as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
                 raise OSError(f"Expected a regular save file: {path}")
+            if not _NOFOLLOW:
+                entry = os.lstat(path)
+                if not stat.S_ISREG(entry.st_mode) or not os.path.samestat(info, entry):
+                    raise OSError(f"The save path changed while opening {path}.")
             return stream.read(SAVE_SIZE + 1)
     except FileNotFoundError:
         return None
@@ -246,6 +306,10 @@ def _lock_save_directory(path):
     directory = os.path.dirname(path)
     if _slot(path) is not None:
         directory = os.path.dirname(os.path.dirname(directory))
+    if _WINDOWS:
+        with _lock_windows(directory):
+            yield
+        return
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -254,9 +318,53 @@ def _lock_save_directory(path):
         os.close(fd)
 
 
+@contextmanager
+def _lock_windows(directory):
+    import ctypes
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("internal", ctypes.c_size_t),
+            ("internal_high", ctypes.c_size_t),
+            ("offset", wintypes.DWORD),
+            ("offset_high", wintypes.DWORD),
+            ("event", wintypes.HANDLE),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle_type, dword = wintypes.HANDLE, wintypes.DWORD
+    kernel.LockFileEx.argtypes = [handle_type, dword, dword, dword, dword, ctypes.POINTER(Overlapped)]
+    kernel.UnlockFileEx.argtypes = [handle_type, dword, dword, dword, ctypes.POINTER(Overlapped)]
+    kernel.LockFileEx.restype = kernel.UnlockFileEx.restype = wintypes.BOOL
+    lock_file_exclusive = 0x2
+
+    # Keep the lock file so concurrent editors always acquire the same lock,
+    # including when the user opens the other commit slot in a second editor.
+    lock = os.path.join(directory, ".ultimate-smasher.lock")
+    with open(lock, "a+b") as stream:
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        region = ctypes.byref(Overlapped())
+        if not kernel.LockFileEx(handle, lock_file_exclusive, 0, 1, 0, region):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield
+        finally:
+            kernel.UnlockFileEx(handle, 0, 1, 0, region)
+            # Closing the handle also releases the lock.
+
+
 def _publish_new(temporary, path):
     """Publish without replacing an existing entry. Return whether the temp still exists."""
-    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if _WINDOWS:
+        # Python's os.rename refuses existing destinations on Windows.
+        os.rename(temporary, path)
+        return False
+    rename = None
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
     if rename is not None:
         # Linux supports this flag on filesystems that cannot create hard links.
         rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
@@ -269,10 +377,16 @@ def _publish_new(temporary, path):
     try:
         os.link(temporary, path)
     except OSError as error:
-        if error.errno in (errno.EPERM, errno.EOPNOTSUPP):
+        if error.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP):
             raise OSError(error.errno, "The destination does not support safe creation of a new save copy", path) from error
         raise
     return True
+
+
+def _write_synced(stream, data):
+    stream.write(data)
+    stream.flush()
+    os.fsync(stream.fileno())
 
 
 def _atomic_write(path, data, *, expected=_UNCHECKED, new_file=False):
@@ -285,15 +399,13 @@ def _atomic_write(path, data, *, expected=_UNCHECKED, new_file=False):
             os.close(fd)
             raise
         with stream as f:
-            if not new_file:
+            if not new_file and not _WINDOWS:
                 try:
                     mode = os.stat(path).st_mode & 0o7777
                 except FileNotFoundError:
                     mode = 0o644
                 os.fchmod(f.fileno(), mode)
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+            _write_synced(f, data)
         if expected is not _UNCHECKED and _read_disk(path) != expected:
             raise SaveConflict(f"The save changed on disk while preparing to replace {path}.")
         if new_file:
@@ -442,7 +554,8 @@ class SaveFile:
             raise InvalidSave("The edited data has an unsupported size")
         path = os.path.abspath(os.fsdecode(path))
         other = self._mirror or mirror_path(self.path)
-        if os.path.realpath(path) in (self.path, other):
+        active_slots = {os.path.normcase(slot) for slot in (self.path, other) if slot}
+        if os.path.normcase(os.path.realpath(path)) in active_slots:
             raise FileExistsError(errno.EEXIST, "Choose a path outside the active save slots", path)
         _atomic_write(path, payload, new_file=True)
         return path
@@ -537,11 +650,8 @@ def make_backup(paths, backup_dir=None, *, prune=True, _snapshots=None):
             target = os.path.join(stage, filename)
             if os.path.exists(target):
                 raise OSError(f"Multiple sources would use the backup filename {filename}.")
-            shutil.copy2(p, target)
-            with open(target, "rb") as stream:
-                if stream.read(SAVE_SIZE + 1) != raw:
-                    raise SaveConflict(f"The source changed while copying the backup: {p}")
-                os.fsync(stream.fileno())
+            with open(target, "xb") as stream:
+                _write_synced(stream, raw)
             entries.append({"source": p, "file": filename, "size": len(raw),
                             "sha256": hashlib.sha256(raw).hexdigest()})
         with open(os.path.join(stage, "metadata.json"), "w", encoding="utf-8") as stream:

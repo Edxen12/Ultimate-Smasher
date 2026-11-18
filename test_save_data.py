@@ -1,11 +1,14 @@
 """Tests for save_data. Uses a copy of a real save if SMASH_TEST_SAVE is set,
 otherwise a synthetic zero-filled file of the right size."""
+import ctypes
 import itertools
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import patch
 
 import save_data as sd
@@ -13,7 +16,7 @@ import save_data as sd
 
 class SaveDataTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         slot0 = os.path.join(self.tmp, "save", "0", "save_data")
         slot1 = os.path.join(self.tmp, "save", "1", "save_data")
         os.makedirs(slot0)
@@ -31,6 +34,14 @@ class SaveDataTest(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
+
+    def make_symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except OSError as error:
+            if os.name == "nt" and (isinstance(error, PermissionError) or getattr(error, "winerror", None) == 1314):
+                self.skipTest("Windows symlink creation requires additional privileges")
+            raise
 
     def test_rejects_wrong_size_or_missing(self):
         bad = os.path.join(self.tmp, "bad.bin")
@@ -79,7 +90,7 @@ class SaveDataTest(unittest.TestCase):
     def test_export_uses_safe_link_when_renameat2_is_unavailable(self):
         s = sd.SaveFile(self.path)
         dest = os.path.join(self.tmp, "edited.bin")
-        with patch.object(sd.ctypes, "CDLL", return_value=object()):
+        with patch.object(ctypes, "CDLL", return_value=object()):
             self.assertEqual(s.export_copy(dest), dest)
             with self.assertRaises(FileExistsError):
                 s.export_copy(dest)
@@ -97,16 +108,19 @@ class SaveDataTest(unittest.TestCase):
         self.assertEqual(error.exception.filename, dest)
         self.assertEqual(sd._read_disk(dest), bytes(s.data))
 
-    def test_export_rejects_existing_names_and_missing_live_slots(self):
+    def test_export_rejects_dangling_symlink(self):
         s = sd.SaveFile(self.path)
-        original = sd._read_disk(self.path)
         dest = os.path.join(self.tmp, "edited.bin")
         dangling = os.path.join(self.tmp, "missing.bin")
-        os.symlink(dangling, dest)
+        self.make_symlink(dangling, dest)
         with self.assertRaises(FileExistsError):
             s.export_copy(dest)
         self.assertTrue(os.path.islink(dest))
         self.assertFalse(os.path.exists(dangling))
+
+    def test_export_rejects_missing_and_existing_live_slots(self):
+        s = sd.SaveFile(self.path)
+        original = sd._read_disk(self.path)
         with self.assertRaises(FileExistsError):
             s.export_copy(self.path)
         self.assertEqual(sd._read_disk(self.path), original)
@@ -187,6 +201,7 @@ class SaveDataTest(unittest.TestCase):
         leftovers = [x for x in os.listdir(os.path.dirname(self.path)) if x.startswith(".smasher-")]
         self.assertEqual(leftovers, [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX file permission bits")
     def test_save_keeps_file_permissions(self):
         os.chmod(self.path, 0o644)
         s = sd.SaveFile(self.path)
@@ -297,16 +312,16 @@ class SaveDataTest(unittest.TestCase):
 
     def test_failed_backup_never_publishes_or_prunes(self):
         dest = sd.make_backup([self.path], self.backups)
-        copy = sd.shutil.copy2
+        write = sd._write_synced
         count = 0
 
-        def fail_second(source, target):
+        def fail_second(stream, data):
             nonlocal count
             count += 1
             if count == 2:
                 raise OSError("disk full")
-            return copy(source, target)
-        with patch.object(sd.shutil, "copy2", side_effect=fail_second), patch.object(sd, "prune_backups") as prune:
+            write(stream, data)
+        with patch.object(sd, "_write_synced", side_effect=fail_second), patch.object(sd, "prune_backups") as prune:
             with self.assertRaises(OSError):
                 sd.make_backup([self.path, self.other], self.backups)
             prune.assert_not_called()
@@ -354,10 +369,14 @@ class SaveDataTest(unittest.TestCase):
     def test_atomic_write_failure_keeps_original_and_closes_fd(self):
         with open(self.path, "rb") as stream:
             original = stream.read()
-        descriptors = len(os.listdir("/proc/self/fd"))
-        with patch.object(sd.os, "fchmod", side_effect=PermissionError("permission denied")), self.assertRaises(PermissionError):
+        with (
+            patch.object(sd.os, "fdopen", wraps=os.fdopen) as fdopen,
+            patch.object(sd, "_write_synced", side_effect=PermissionError("permission denied")),
+            self.assertRaises(PermissionError),
+        ):
             sd._atomic_write(self.path, b"new data")
-        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors)
+        with self.assertRaises(OSError):
+            os.fstat(fdopen.call_args.args[0])
         with open(self.path, "rb") as stream:
             self.assertEqual(stream.read(), original)
         self.assertFalse(any(name.startswith(".smasher-") for name in os.listdir(os.path.dirname(self.path))))
@@ -411,7 +430,7 @@ class SaveDataTest(unittest.TestCase):
         s = sd.SaveFile(self.path)
         original = bytes(s.data)
         s.set_value(sd.TICKETS, 14)
-        with patch.object(sd.shutil, "copy2", side_effect=OSError("disk full")), self.assertRaises(OSError):
+        with patch.object(sd, "_write_synced", side_effect=OSError("disk full")), self.assertRaises(OSError):
             s.save(self.backups)
         for path in (self.path, self.other):
             with open(path, "rb") as stream:
@@ -490,7 +509,7 @@ class SaveDataTest(unittest.TestCase):
 
     def test_save_through_symlink_updates_the_target_and_keeps_the_link(self):
         link = os.path.join(self.tmp, "alias.bin")
-        os.symlink(self.path, link)
+        self.make_symlink(self.path, link)
         s = sd.SaveFile(link)
         s.set_value(sd.TICKETS, 33)
         s.save(self.backups)
@@ -507,18 +526,43 @@ class SaveDataTest(unittest.TestCase):
         self.assertFalse(os.path.exists(dest))
         self.assertTrue(os.path.isdir(user_folder))
 
+    def test_concurrent_saves_from_opposite_slots_share_one_lock(self):
+        saves = (sd.SaveFile(self.path), sd.SaveFile(self.other))
+        barrier = Barrier(len(saves))
+        baseline = saves[0].value(sd.TICKETS)
+        values = tuple((baseline + i) % (sd.TICKETS.maximum + 1) for i in (1, 2))
+
+        def save(smasher, value):
+            smasher.set_value(sd.TICKETS, value)
+            barrier.wait(timeout=5)
+            try:
+                smasher.save(self.backups)
+            except sd.SaveConflict:
+                return None
+            return value
+
+        with ThreadPoolExecutor(max_workers=len(saves)) as pool:
+            results = list(pool.map(save, saves, values))
+        self.assertIn(None, results)
+        winner = sd.SaveFile(self.path).value(sd.TICKETS)
+        self.assertCountEqual(results, [None, winner])
+        self.assertEqual(sd.SaveFile(self.other).value(sd.TICKETS), winner)
+        self.assertEqual(len(sd.list_backups(self.backups)), 1)
+
 
 class DefaultSavePathTest(unittest.TestCase):
     def test_prefers_historical_then_legacy_and_native_locations(self):
         with tempfile.TemporaryDirectory() as home:
-            suffix = "Ryujinx/bis/user/save/0000000000000001/0/save_data/system_data.bin"
-            historical = os.path.join(home, ".var/app/io.github.ryubing.Ryujinx/config", suffix)
-            legacy = os.path.join(home, ".var/app/org.ryujinx.Ryujinx/config", suffix)
+            suffix = sd._RYUJINX_PRIMARY_SAVE
+            historical = os.path.join(home, ".var", "app", "io.github.ryubing.Ryujinx", "config", suffix)
+            legacy = os.path.join(home, ".var", "app", "org.ryujinx.Ryujinx", "config", suffix)
             config = os.path.join(home, "custom-config")
             native = os.path.join(config, suffix)
             with (
-                patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": config}),
+                patch.dict(os.environ, {"HOME": home, "USERPROFILE": home, "XDG_CONFIG_HOME": config}),
                 patch.object(sd, "RYUJINX_SAVE", historical),
+                patch.object(sd, "_WINDOWS", False),
+                patch.object(sd.sys, "platform", "linux"),
             ):
                 for path in (historical, legacy, native):
                     os.makedirs(os.path.dirname(path))
@@ -532,19 +576,39 @@ class DefaultSavePathTest(unittest.TestCase):
 
     def test_ignores_slot_one_and_relative_xdg_config(self):
         with tempfile.TemporaryDirectory() as home:
-            root = os.path.join(home, ".config/Ryujinx/bis/user/save/0000000000000001")
-            primary, mirror = (os.path.join(root, str(slot), "save_data/system_data.bin") for slot in (0, 1))
+            primary = os.path.join(home, ".config", sd._RYUJINX_PRIMARY_SAVE)
+            root = os.path.dirname(os.path.dirname(os.path.dirname(primary)))
+            mirror = os.path.join(root, "1", "save_data", "system_data.bin")
             os.makedirs(os.path.dirname(mirror))
             with open(mirror, "wb") as stream:
                 stream.truncate(sd.SAVE_SIZE)
             with (
-                patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": "relative"}),
+                patch.dict(os.environ, {"HOME": home, "USERPROFILE": home, "XDG_CONFIG_HOME": "relative"}),
                 patch.object(sd, "RYUJINX_SAVE", os.path.join(home, "missing.bin")),
+                patch.object(sd, "_WINDOWS", False),
+                patch.object(sd.sys, "platform", "linux"),
             ):
                 self.assertEqual(sd.default_save_path(), "")
                 os.makedirs(os.path.dirname(primary))
                 os.rename(mirror, primary)
                 self.assertEqual(sd.default_save_path(), primary)
+
+    def test_looks_in_windows_appdata_and_macos_application_support(self):
+        with tempfile.TemporaryDirectory() as home:
+            appdata = os.path.join(home, "Roaming")
+            application_support = os.path.join(home, "Library", "Application Support")
+            for platform, root in (("win32", appdata), ("darwin", application_support)):
+                with (
+                    self.subTest(platform=platform),
+                    patch.dict(os.environ, HOME=home, USERPROFILE=home, APPDATA=appdata),
+                    patch.object(sd, "_WINDOWS", platform == "win32"),
+                    patch.object(sd.sys, "platform", platform),
+                ):
+                    save = os.path.join(root, sd._RYUJINX_PRIMARY_SAVE)
+                    os.makedirs(os.path.dirname(save))
+                    with open(save, "wb") as stream:
+                        stream.truncate(sd.SAVE_SIZE)
+                    self.assertEqual(sd.default_save_path(), save)
 
 
 if __name__ == "__main__":

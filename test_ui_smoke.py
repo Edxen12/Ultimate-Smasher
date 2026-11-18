@@ -41,6 +41,7 @@ class UiSmokeTest(unittest.TestCase):
         sd.ryujinx_running = lambda: False
         with patch.object(smash_ui.gamepad.Gamepad, "scan"):
             cls.app, cls.win = smash_ui.main(["x", cls.path])
+        cls.initial_page_count = len(cls.win.pages)
         pump(300)
 
     @classmethod
@@ -128,6 +129,7 @@ class UiSmokeTest(unittest.TestCase):
             pump()
 
     def test_6_default_is_compact_desktop_window(self):
+        self.assertEqual(self.initial_page_count, 0)
         self.assertFalse(self.win.isFullScreen())
         self.assertEqual((self.win.width(), self.win.height()), (1040, 590))
         self.assertFalse(self.win.windowFlags() & Qt.FramelessWindowHint)
@@ -326,10 +328,9 @@ class UiSmokeTest(unittest.TestCase):
     def test_18_small_logical_screen_keeps_controls_inside(self):
         w = self.win
         try:
-            # Fullscreen can be smaller than the normal window minimum on HiDPI screens.
-            w.setMinimumSize(0, 0)
             for size in ((960, 540), (800, 450)):
                 w.resize(*size); pump()
+                self.assertEqual((w.width(), w.height()), size)
                 for name, *_ in smash_ui.SECTIONS:
                     w.open_section(name); pump(260)
                     page = w.pages[w.current]
@@ -341,7 +342,6 @@ class UiSmokeTest(unittest.TestCase):
                 overlay.close_overlay()
                 pump(200)
         finally:
-            w.setMinimumSize(1040, 590)
             w.resize(1040, 590)
             w.show_hub(); pump(300)
 

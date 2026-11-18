@@ -80,6 +80,7 @@ APP_ICON = os.path.join(IMG, "ui", "app.svg")
 APP_TITLE = "ULTIMATE SMASHER"
 
 W, H = 1040, 590
+MIN_WINDOW_SIZE = (800, 450)
 M = tokens.spacing.margin
 HB = 56         # header band height
 SB_H = 58       # status bar height
@@ -1827,8 +1828,10 @@ class Hub(QWidget):
     def rail_at(self, pos):
         return hg.rail_at(self.width(), self.height(), QPointF(pos), len(RAIL))
 
-    def play_intro(self, ms=600):
-        tween(self, "intro", 0.0, 1.0, ms, self._intro)
+    def play_intro(self, ms):
+        if not settings.reduced_motion:
+            self._intro(0.9)
+        tween(self, "intro", 0.9, 1.0, ms, self._intro)
 
     def _intro(self, value):
         self.intro = value; self.update()
@@ -2599,14 +2602,16 @@ class FighterTile(AnimButton):
         super().__init__(parent, name)
         self.idx = idx
         self.img = img
+        self.search_name = search_key(name)
         self.sfx = None
         self.setFocusPolicy(Qt.StrongFocus)
         self.src = pixmap(f"portraits/{img}.png")
         self._gray = {}
-        self.unlocked = True
+        self.unlocked = None
         self.pop = 0.0
         self.selected = False
         self.page = None
+        self.set_state(True)
 
     def art(self, kind):
         """Portrait or render, grey when locked; loaded lazily (only one is shown at a time)."""
@@ -2634,7 +2639,8 @@ class FighterTile(AnimButton):
         return 0
 
     def set_state(self, unlocked, animate=False, delay=0):
-        changed = unlocked != self.unlocked
+        if unlocked == self.unlocked and not animate:
+            return
         self.unlocked = unlocked
         self.desc = f"{self.title} — {'unlocked (click to lock)' if unlocked else 'locked (click to unlock)'}"
         self.setToolTip(self.desc)
@@ -2642,7 +2648,7 @@ class FighterTile(AnimButton):
         status = getattr(self.window(), "status", None)
         if status and (self.underMouse() or self.hasFocus()):
             status.describe(self.desc)
-        if animate and changed:
+        if animate:
             tween(self, "pop", 1.0, 0.0, 420, self._set("pop"), QEasingCurve.OutQuad, delay=delay)
             if delay:
                 QTimer.singleShot(int(delay), self.update)
@@ -2707,7 +2713,7 @@ class CharactersPage(Page):
         self.filter = QComboBox(self)
         self.filter.addItems(["All base fighters", "Locked", "Unlocked", "Changed"])
         self.filter.setAccessibleName("Filter fighters by unlock state or pending changes")
-        filter_arrow = os.path.join(IMG, "ui", "chevron-down.svg")
+        filter_arrow = os.path.join(IMG, "ui", "chevron-down.svg").replace(os.sep, "/")
         self.filter.setStyleSheet(
             "QComboBox { background: #ffd400; color: #111; border: 2px solid #111;"
             "font-family: 'Nunito'; font-size: 14px; font-weight: 800; padding: 4px 28px 4px 8px; }"
@@ -2788,21 +2794,25 @@ class CharactersPage(Page):
         focus = QApplication.focusWidget()
         query = search_key(self.search.text())
         state = self.filter.currentIndex()
-        self.visible_tiles = []
+        visible_tiles = []
         for tile in self.tiles:
             if state == 3:
                 offset = sd.fighter_offset(tile.idx)
                 show_state = bool(self.save and self.save.data[offset] != self.save.clean[offset])
             else:
                 show_state = state == 0 or tile.unlocked == (state == 2)
-            match = query in search_key(tile.title) and show_state
-            tile.setVisible(match)
+            match = query in tile.search_name and show_state
+            if match == tile.isHidden():
+                tile.setVisible(match)
             if match:
-                self.visible_tiles.append(tile)
+                visible_tiles.append(tile)
+        relayout = visible_tiles != self.visible_tiles
+        self.visible_tiles = visible_tiles
         count = len(self.visible_tiles)
         self.results.setText(f"{count} / {len(self.tiles)} base fighters")
         self.empty.setVisible(count == 0)
-        self.layout_roster()
+        if relayout:
+            self.layout_roster()
         if focus in self.tiles and focus not in self.visible_tiles:
             self.filter.setFocus(Qt.OtherFocusReason)
 
@@ -2846,9 +2856,9 @@ class CharactersPage(Page):
         self.app.store.edit(run, label="Unlock base fighters" if value else "Lock base fighters")
         play("unlock" if value else "lock")
         for t in self.tiles:
-            t.unlocked = before[t.idx]
-            r, c = divmod(t.idx, getattr(self, "columns", self.COLS))
-            t.set_state(value, animate=True, delay=(r + c) * 22)
+            if before[t.idx] != value:
+                r, c = divmod(t.idx, self.columns)
+                t.set_state(value, animate=True, delay=(r + c) * 22)
         self.app.toast("ALL FIGHTERS UNLOCKED!" if value else "ALL FIGHTERS LOCKED")
 
     def confirm_lock_all(self):
@@ -3324,7 +3334,7 @@ class MainWindow(QWidget):
         super().__init__(None)
         self.setWindowTitle("Ultimate Smasher")
         self.setWindowIcon(QIcon(APP_ICON))
-        self.setMinimumSize(W, H)
+        self.setMinimumSize(*MIN_WINDOW_SIZE)
         self.resize(W, H)
         self._was_maximized = False
         self._windowed_geometry = self.geometry()
@@ -3391,17 +3401,16 @@ class MainWindow(QWidget):
         overlap = 6
         span = W - 2 * M - 70 + overlap * (len(SECTIONS) - 1)
         widths = [span * w / sum(weights) for w in weights]
-        self.tabs, self.pages, self.tab_x = [], [], []
+        self.tabs, self.tab_x = [], []
+        self.pages = {}
         tx = float(M + 35)
-        for (name, glyph, cls), wd in zip(SECTIONS, widths):
+        for (name, glyph, _), wd in zip(SECTIONS, widths):
             t = SlantTab(name, glyph, self)
             t.setGeometry(round(tx), TAB_Y, round(wd), TAB_H)
             self.tab_x.append(round(tx))
             t.clicked.connect(lambda _=False, n=name: self.select(n))
             self.tabs.append(t)
             tx += wd - overlap
-            page = cls(self, self.panel); page.hide()
-            self.pages.append(page)
         self.key_q = KeyHint("Q", self); self.key_q.setGeometry(M - 4, TAB_Y + 18, 30, 30)
         self.key_e = KeyHint("E", self); self.key_e.setGeometry(W - M - 26, TAB_Y + 18, 30, 30)
         self.empty = EmptyState(self, self.panel)
@@ -3414,9 +3423,6 @@ class MainWindow(QWidget):
         self.status = StatusBar(self.store, self)
         self.status.setGeometry(0, H - SB_H, W, SB_H)
         self.selection_cursor = Cursor(self)
-        for scroll in self.findChildren(QScrollArea):
-            scroll.verticalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
-            scroll.horizontalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
         self.toast_w = Toast(self)
         self.store.changed.connect(self.on_change)
         QApplication.instance().focusChanged.connect(self.focus_changed)
@@ -3440,7 +3446,7 @@ class MainWindow(QWidget):
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            self.setMinimumSize(W, H)
+            self.setMinimumSize(*MIN_WINDOW_SIZE)
             self.setGeometry(self._windowed_geometry)
             if self._was_maximized:
                 self.showMaximized()
@@ -3458,7 +3464,7 @@ class MainWindow(QWidget):
         w, h = self.width(), self.height()
         panel_h = h - PANEL_Y - SB_H
         self.panel.setGeometry(0, PANEL_Y, w, panel_h)
-        for page in self.pages:
+        for page in self.pages.values():
             animation = page.__dict__.get("_slide")
             if animation is not None:
                 animation.stop()
@@ -3506,7 +3512,7 @@ class MainWindow(QWidget):
 
     def motion_changed(self, reduced):
         if reduced:
-            for page in self.pages:
+            for page in self.pages.values():
                 animation = page.__dict__.get("_slide")
                 if animation is not None:
                     animation.stop()
@@ -3572,8 +3578,9 @@ class MainWindow(QWidget):
         self.save_btn.style = "yellow" if dirty else "dark"
         self.save_btn.setEnabled(self.store.loaded and dirty and not self.store.busy)
         self.save_btn.update()
-        if self.current is not None and self.store.loaded:
-            self.pages[self.current].refresh()
+        page = self.pages.get(self.current)
+        if page is not None and self.store.loaded:
+            page.refresh()
         if self.current is None:
             self.hub.tile_info = {name: self.hub_info(name) for name in SECTION_DESC}
             self.hub.update()
@@ -3599,10 +3606,21 @@ class MainWindow(QWidget):
         return ""
 
     # -------------------------------------------------------- navigation --
+    def section_page(self, index):
+        if index not in self.pages:
+            page = SECTIONS[index][2](self, self.panel)
+            page.setGeometry(0, 8, self.panel.width(), self.panel.height() - 8)
+            for scroll in page.findChildren(QScrollArea):
+                scroll.verticalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
+                scroll.horizontalScrollBar().valueChanged.connect(self.selection_cursor.scroll_changed)
+            self.pages[index] = page
+        return self.pages[index]
+
     def show_hub(self, intro=False):
         self.commit_pending_edit()
-        if self.current is not None:
-            self.pages[self.current]._last_focus = QApplication.focusWidget()
+        page = self.pages.get(self.current)
+        if page is not None:
+            page._last_focus = QApplication.focusWidget()
         self.current = None
         self.hub.tile_info = {name: self.hub_info(name) for name in SECTION_DESC}
         self.set_header(APP_TITLE)
@@ -3614,7 +3632,7 @@ class MainWindow(QWidget):
             button.hide()
         self.update()
         self.hub.show(); self.hub.raise_()
-        self.hub.play_intro(600 if intro else 280)
+        self.hub.play_intro(220 if intro else 160)
         self.hub.setFocus()
         self.status.hide(); self.toast_w.raise_()
         self.status.update()
@@ -3650,8 +3668,9 @@ class MainWindow(QWidget):
         if direction is None:
             direction = 1 if self.current is None or idx >= self.current else -1
         prev = self.current
-        if prev is not None:
-            self.pages[prev]._last_focus = QApplication.focusWidget()
+        previous_page = self.pages.get(prev)
+        if previous_page is not None:
+            previous_page._last_focus = QApplication.focusWidget()
         self.commit_pending_edit()
         self.current = idx
         if prev is not None and prev != idx:
@@ -3663,12 +3682,12 @@ class MainWindow(QWidget):
             t.setChecked(i == idx)
         self.empty.setVisible(not self.store.loaded)
         if not self.store.loaded:
-            for pg in self.pages:
+            for pg in self.pages.values():
                 pg.hide()
             return
-        page = self.pages[idx]
+        page = self.section_page(idx)
         page.refresh()
-        for j, pg in enumerate(self.pages):
+        for j, pg in self.pages.items():
             if j != idx:
                 pg.hide()
         page.show(); page.raise_()
@@ -3820,10 +3839,15 @@ class MainWindow(QWidget):
             if callable(after):
                 after()
             return
-        if sd.ryujinx_running():
-            ConfirmOverlay(self, "Ryujinx is running",
-                           "If the game is open, it will overwrite your changes (or the save may get corrupted). "
-                           "<b>Close the game in Ryujinx first.</b>",
+        self.run_disk_job("Checking emulator", sd.ryujinx_running,
+                          lambda running, error: self.confirm_save(running, error, after))
+
+    def confirm_save(self, running, error, after):
+        if running or error is not None:
+            title = "Ryujinx is running" if running else "Emulator check unavailable"
+            message = ("If the game is open, it can overwrite your changes or interrupt the write. "
+                       "<b>Close the game before saving.</b>")
+            ConfirmOverlay(self, title, message,
                            [("SAVE ANYWAY", G["warn"], "red", lambda: self._write(after)),
                             ("CANCEL", G["back"], "dark", None)]).open()
         else:
@@ -3939,9 +3963,9 @@ class MainWindow(QWidget):
                 and w.focusPolicy() & Qt.TabFocus]
 
     def move_focus(self, k):
-        if self.current is None or self.overlay_open():
+        page = self.pages.get(self.current)
+        if page is None or self.overlay_open():
             return
-        page = self.pages[self.current]
         spatial_focus(page, self.focusables(page), k)
 
     def mousePressEvent(self, e):

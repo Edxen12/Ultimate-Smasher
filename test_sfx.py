@@ -1,9 +1,10 @@
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
@@ -44,10 +45,10 @@ class SoundEffectsTest(unittest.TestCase):
         self.assertFalse(player.procs)
 
     def test_qt_reaps_finished_playback_without_another_sound(self):
-        command = shutil.which("true")
-        self.assertIsNotNone(command)
+        command = shutil.which("true") or sys.executable
         with (
             patch.dict(os.environ, SMASHER_MUTE=""),
+            patch.object(sfx, "winsound", None),
             patch.object(sfx.shutil, "which", return_value=command),
             patch.object(sfx, "ensure_files", return_value=Path(sfx.DIR)),
         ):
@@ -61,6 +62,20 @@ class SoundEffectsTest(unittest.TestCase):
                     break
                 QTest.qWait(10)
             self.assertFalse(player.procs)
+
+    def test_native_audio_plays_asynchronously_and_mute_stops_it(self):
+        native = Mock(SND_FILENAME=1, SND_ASYNC=2, SND_NODEFAULT=4)
+        with (
+            patch.dict(os.environ, SMASHER_MUTE=""),
+            patch.object(sfx, "winsound", native),
+            patch.object(sfx, "ensure_files", return_value=Path(sfx.DIR)),
+        ):
+            player = sfx.Player()
+            player.play("move")
+            self.assertFalse(player.toggle())
+        self.assertEqual(native.PlaySound.call_args_list, [
+            call(str(Path(sfx.DIR) / "move.wav"), 7), call(None, 0),
+        ])
 
 
 if __name__ == "__main__":
